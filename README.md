@@ -8,6 +8,15 @@ back when finished. The next person does the same.
 A "lock" stored in the cloud tracks whose turn it is, so two people don't host
 from stale copies and split the world into two diverging timelines.
 
+![The Valheim Sync app](docs/screenshot.png)
+
+## Download
+
+Grab the latest zip from the [**Releases**](../../releases/latest) page, unzip
+it anywhere, and double-click `Valheim Sync.vbs`. `rclone` downloads itself on
+first run; then click **Setup** to connect your Backblaze bucket. (No
+`config.json` ships in the download — you create yours in Setup.)
+
 ## How to use it — just one file
 
 Double-click **`Valheim Sync.vbs`**. That opens the app — a window with
