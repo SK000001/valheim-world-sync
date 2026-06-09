@@ -1,0 +1,12 @@
+{
+  "WorldName": "your-world-name",
+  "WorldsPath": "%USERPROFILE%\\AppData\\LocalLow\\IronGate\\Valheim\\worlds_local",
+  "Player": "your-name",
+  "DiscordWebhook": "",
+  "LockStaleHours": 6,
+  "B2": {
+    "Bucket": "your-bucket-name",
+    "KeyId": "PASTE_KEY_ID_HERE",
+    "AppKey": "PASTE_APP_KEY_HERE"
+  }
+}

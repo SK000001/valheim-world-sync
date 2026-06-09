@@ -1,0 +1,15 @@
+# Your real config holds your Backblaze key — NEVER commit it.
+config.json
+
+# rclone is downloaded automatically on first run (78 MB, no need to commit)
+bin/
+
+# Personal, per-machine world backups
+local-backups/
+
+# Generated at runtime
+valheim-sync.ico
+
+# The "Share to friends" package (contains your key)
+ValheimSync-for-friends.zip
+*.zip
