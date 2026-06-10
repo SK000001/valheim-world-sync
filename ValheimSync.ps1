@@ -343,6 +343,20 @@ function Do-Extract {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Ok "World '$($cfg.WorldName)' is ready to play."
 
+    # Re-read the manifest right before claiming: someone may have pressed
+    # EXTRACT at the same time and grabbed the lock while we were downloading.
+    # Deliberately a hard abort (not a -Force-able confirm) - this is an active,
+    # seconds-old conflict, not a maybe-stale one.
+    $m2 = Get-Manifest $exe $cfg
+    if ($m2) {
+        $sameLock = $m.hosting -and $m.hosting.player -and $m2.hosting -and
+                    $m.hosting.player -eq $m2.hosting.player -and $m.hosting.sinceUtc -eq $m2.hosting.sinceUtc
+        if ($m2.hosting -and $m2.hosting.player -and $m2.hosting.player -ne $me -and -not $sameLock) {
+            throw "$($m2.hosting.player) claimed the host lock while you were downloading. Coordinate who hosts, then try again."
+        }
+        $m = $m2
+    }
+
     # Claim the lock - it's your turn to host.
     if (-not $m.hosting) { $m | Add-Member -NotePropertyName hosting -NotePropertyValue $null -Force }
     $m.hosting = [pscustomobject]@{ player = $me; sinceUtc = (Get-Date).ToUniversalTime().ToString('o') }
