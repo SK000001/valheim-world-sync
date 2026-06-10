@@ -109,8 +109,18 @@ function Ensure-Rclone {
 
     Write-Step "rclone not found - downloading it once (~20 MB)..."
     $zip = Join-Path $env:TEMP 'rclone-current.zip'
-    $url = 'https://downloads.rclone.org/rclone-current-windows-amd64.zip'
-    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    # Pinned, known-good version first so a breaking rclone release can't take
+    # down every machine on the same day; fall back to current if it vanishes.
+    $urls = @(
+        'https://downloads.rclone.org/v1.68.2/rclone-v1.68.2-windows-amd64.zip',
+        'https://downloads.rclone.org/rclone-current-windows-amd64.zip'
+    )
+    $downloaded = $false
+    foreach ($url in $urls) {
+        try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing; $downloaded = $true; break }
+        catch { Write-Warn2 "(download failed from $url - trying the next mirror)" }
+    }
+    if (-not $downloaded) { throw "Could not download rclone. Check your internet connection." }
     $extract = Join-Path $env:TEMP 'rclone-extract'
     if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
     Expand-Archive -Path $zip -DestinationPath $extract -Force
