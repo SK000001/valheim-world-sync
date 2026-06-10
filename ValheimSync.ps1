@@ -579,6 +579,15 @@ function Do-Setup {
     $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($appKey))
     if ($plain) { $cfg.B2.AppKey = $plain }
+    $detected = @()
+    try {
+        $wl = Get-WorldsPath $cfg
+        if (Test-Path $wl) {
+            $detected = @(Get-ChildItem $wl -File | Where-Object { $_.Extension -eq '.db' } |
+                ForEach-Object { $_.BaseName } | Sort-Object -Unique)
+        }
+    } catch {}
+    if ($detected) { Write-Host "  Worlds found on this PC: $($detected -join ', ')" -ForegroundColor Gray }
     $world = Read-Host "  World name [$($cfg.WorldName)]"
     if ($world) { $cfg.WorldName = $world }
     $player = Read-Host "  Your name (for the host lock) [$(if($cfg.Player){$cfg.Player}else{$env:USERNAME})]"

@@ -525,6 +525,18 @@ $btnOpen.Add_Click({
     if (Test-Path $worlds) { Start-Process explorer.exe $worlds } else { Info-Box "Save folder not found:`r`n$worlds" }
 })
 
+# Worlds that exist in the local save folder (one .db per world).
+function Get-DetectedWorlds {
+    try {
+        $wl = [System.Environment]::ExpandEnvironmentVariables('%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local')
+        if (Test-Path $wl) {
+            return @(Get-ChildItem $wl -File | Where-Object { $_.Extension -eq '.db' } |
+                ForEach-Object { $_.BaseName } | Sort-Object -Unique)
+        }
+    } catch {}
+    return @()
+}
+
 # ---------- Setup dialog ----------
 $btnSetup.Add_Click({
     $cfg = $null
@@ -557,7 +569,22 @@ $btnSetup.Add_Click({
     $tBucket = Add-Field 'Bucket name'        14  ($(if($cfg){$cfg.B2.Bucket})) $false
     $tKey    = Add-Field 'keyID'              62  ($(if($cfg -and $cfg.B2.KeyId -ne 'PASTE_KEY_ID_HERE'){$cfg.B2.KeyId})) $false
     $tApp    = Add-Field 'applicationKey'     110 ($(if($cfg -and $cfg.B2.AppKey -ne 'PASTE_APP_KEY_HERE'){$cfg.B2.AppKey})) $true
-    $tWorld  = Add-Field 'World name'         158 ($(if($cfg){$cfg.WorldName}else{'sivandarvin'})) $false
+
+    # world name: editable dropdown pre-filled with the worlds found on this PC,
+    # so nobody has to type (and typo) the name by hand
+    $lWorld = New-Object System.Windows.Forms.Label
+    $lWorld.Text = 'World name (detected from your save folder)'
+    $lWorld.ForeColor = [System.Drawing.Color]::Gainsboro
+    $lWorld.Location = New-Object System.Drawing.Point(20, 158)
+    $lWorld.Size = New-Object System.Drawing.Size(380, 18)
+    $dlg.Controls.Add($lWorld)
+    $tWorld = New-Object System.Windows.Forms.ComboBox
+    $tWorld.DropDownStyle = 'DropDown'
+    $tWorld.Location = New-Object System.Drawing.Point(20, 178)
+    $tWorld.Size = New-Object System.Drawing.Size(380, 24)
+    foreach ($n in (Get-DetectedWorlds)) { [void]$tWorld.Items.Add($n) }
+    $tWorld.Text = $(if ($cfg) { $cfg.WorldName } elseif ($tWorld.Items.Count -gt 0) { [string]$tWorld.Items[0] } else { 'sivandarvin' })
+    $dlg.Controls.Add($tWorld)
     $tPlayer = Add-Field 'Your name (host lock)' 206 ($(if($cfg -and $cfg.Player){$cfg.Player}else{$env:USERNAME})) $false
     $existingHook = if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'DiscordWebhook')) { $cfg.DiscordWebhook } else { '' }
     $tDiscord = Add-Field 'Discord webhook URL (optional)' 254 $existingHook $false
