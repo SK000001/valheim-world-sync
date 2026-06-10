@@ -537,11 +537,42 @@ $btnUpload.Add_Click({
 
 $btnRefresh.Add_Click({ Refresh-Status })
 
+# Replace the LOCAL world with a zip from local-backups/ (the cloud is not
+# touched). The current local world is zipped first as a safety net.
+function Restore-LocalBackup {
+    $bdir = Join-Path $ScriptDir 'local-backups'
+    $pick = New-Object System.Windows.Forms.OpenFileDialog
+    $pick.Title = 'Pick a local backup zip'
+    $pick.Filter = 'Backup zips (*.zip)|*.zip'
+    if (Test-Path $bdir) { $pick.InitialDirectory = $bdir }
+    if ($pick.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    if (-not (Confirm-Box "Replace your LOCAL world with this backup?`r`n`r`n$(Split-Path $pick.FileName -Leaf)`r`n`r`nThe cloud is not touched, and your current local world is backed up first.")) { return }
+    try {
+        $c = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        $worlds = [System.Environment]::ExpandEnvironmentVariables($c.WorldsPath)
+        $db = Join-Path $worlds "$($c.WorldName).db"
+        $fwl = Join-Path $worlds "$($c.WorldName).fwl"
+        if (Test-Path $db) {
+            if (-not (Test-Path $bdir)) { New-Item -ItemType Directory -Path $bdir | Out-Null }
+            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $keep = @($db, $fwl, "$db.old", "$fwl.old") | Where-Object { Test-Path $_ }
+            Compress-Archive -Path $keep -DestinationPath (Join-Path $bdir "$($c.WorldName)_pre-localrestore_$stamp.zip") -Force
+        }
+        Expand-Archive -Path $pick.FileName -DestinationPath $worlds -Force
+        Append-Log "Restored local backup: $(Split-Path $pick.FileName -Leaf)"
+        Refresh-Status
+        Info-Box "Done - your local world was replaced with the backup.`r`n`r`nIf this is the good copy, press UPLOAD to publish it for the group."
+    } catch { Info-Box "Local restore failed: $($_.Exception.Message)" }
+}
+
 $btnRestore.Add_Click({
     Invoke-Action 'History' {
         param($out)
         $h = Parse-Probe $out
-        if (-not $h -or -not $h.history -or $h.history.Count -eq 0) { Info-Box "No saved versions found in history yet."; return }
+        if (-not $h -or -not $h.history -or $h.history.Count -eq 0) {
+            if (Confirm-Box "No saved versions in the cloud history yet.`r`n`r`nRestore your LOCAL world from this PC's backups instead?") { Restore-LocalBackup }
+            return
+        }
 
         # build a picker dialog
         $dlg = New-Object System.Windows.Forms.Form
@@ -586,7 +617,17 @@ $btnRestore.Add_Click({
         $cancel.FlatStyle = 'Flat'; $cancel.BackColor = [System.Drawing.Color]::FromArgb(55, 58, 66); $cancel.ForeColor = 'Gainsboro'
         $dlg.Controls.Add($cancel); $dlg.CancelButton = $cancel
 
-        if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK -and $list.SelectedIndex -ge 0) {
+        $localBtn = New-Object System.Windows.Forms.Button
+        $localBtn.Text = 'From this PC...'
+        $localBtn.Location = New-Object System.Drawing.Point(16, 278); $localBtn.Size = New-Object System.Drawing.Size(110, 30)
+        $localBtn.FlatStyle = 'Flat'; $localBtn.BackColor = [System.Drawing.Color]::FromArgb(55, 58, 66); $localBtn.ForeColor = 'Gainsboro'
+        # $this = the button; tag the form so the caller knows to go local
+        $localBtn.Add_Click({ $this.FindForm().Tag = 'local'; $this.FindForm().Close() })
+        $dlg.Controls.Add($localBtn)
+
+        $dlgResult = $dlg.ShowDialog($form)
+        if ($dlg.Tag -eq 'local') { Restore-LocalBackup; return }
+        if ($dlgResult -eq [System.Windows.Forms.DialogResult]::OK -and $list.SelectedIndex -ge 0) {
             $chosen = $files[$list.SelectedIndex]
             if (-not (Confirm-Box "Make this save the current world for everyone?`r`n`r`n$($list.SelectedItem)`r`n`r`nThe current latest stays safe in history.")) { return }
             Invoke-Action 'Restore' {
