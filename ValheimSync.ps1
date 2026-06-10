@@ -201,6 +201,12 @@ function Format-Age($utcString) {
     } catch { return $utcString }
 }
 
+function Format-Span([timespan]$span) {
+    if ($span.TotalMinutes -lt 1) { return 'under a minute' }
+    if ($span.TotalMinutes -lt 60) { return "$([int][math]::Floor($span.TotalMinutes)) min" }
+    return "$([int][math]::Floor($span.TotalHours)) h $($span.Minutes) min"
+}
+
 # ---------- guards ----------
 function Assert-GameClosed {
     $procs = Get-Process -Name 'valheim', 'valheim_server' -ErrorAction SilentlyContinue
@@ -362,7 +368,7 @@ function Do-Extract {
     $m.hosting = [pscustomobject]@{ player = $me; sinceUtc = (Get-Date).ToUniversalTime().ToString('o') }
     Set-Manifest $exe $cfg $m
     Write-Ok "Lock claimed - you're marked as the host."
-    Send-Discord $cfg ":red_circle: **$me** is now hosting **$($cfg.WorldName)** - world is in use."
+    Send-Discord $cfg ":red_circle: **$me** is now hosting **$($cfg.WorldName)** - world is in use (picking up $($m.uploadedBy)'s save from $(Format-Age $m.uploadedAtUtc))."
     Write-Host ''
     Write-Host "  >> Host the world in-game now. When you're done, press UPLOAD. <<" -ForegroundColor Cyan
     Write-Host ''
@@ -440,7 +446,11 @@ function Do-Upload {
     }
     Set-Manifest $exe $cfg $manifest
     Write-Ok "World uploaded. Lock released - anyone can EXTRACT and host next."
-    Send-Discord $cfg ":green_circle: **$me** finished playing **$($cfg.WorldName)** - world is free to host."
+    $details = @('world is {0:N1} MB' -f ((Get-Item $db).Length / 1MB))
+    if ($m -and $m.hosting -and $m.hosting.player -eq $me -and $m.hosting.sinceUtc) {
+        try { $details = @("played $(Format-Span ((Get-Date).ToUniversalTime() - [datetime]::Parse($m.hosting.sinceUtc).ToUniversalTime()))") + $details } catch {}
+    }
+    Send-Discord $cfg ":green_circle: **$me** finished playing **$($cfg.WorldName)** - world is free to host ($($details -join ', '))."
     Invoke-StorageCleanup $exe $cfg
     Write-Host ''
 }
