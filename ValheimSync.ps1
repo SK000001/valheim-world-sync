@@ -775,10 +775,12 @@ function Do-Restore {
     Write-Host ''
 }
 
-# Machine-readable list of worlds that exist in the cloud bucket, for the GUI dropdown.
+# Machine-readable list of worlds that exist in the cloud bucket, for the GUI
+# dropdown - plus the total bucket size so the GUI can show free-tier usage.
 function Do-Worlds {
     $worlds = @()
     $current = ''
+    $bucketBytes = 0
     try {
         $cfg = Get-Config
         $current = $cfg.WorldName
@@ -790,8 +792,12 @@ function Do-Worlds {
                 if ($name) { $worlds += $name }
             }
         }
+        $sz = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('size', ":b2:$($cfg.B2.Bucket)", '--json') -AllowFail
+        if ($sz.Code -eq 0 -and $sz.Output -match '\{.+\}') {
+            try { $bucketBytes = [long]((($Matches[0]) | ConvertFrom-Json).bytes) } catch {}
+        }
     } catch {}
-    Emit-Probe ([ordered]@{ worlds = @($worlds | Sort-Object -Unique); current = $current })
+    Emit-Probe ([ordered]@{ worlds = @($worlds | Sort-Object -Unique); current = $current; bucketBytes = $bucketBytes })
 }
 
 # ============================================================

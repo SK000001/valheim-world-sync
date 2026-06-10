@@ -37,6 +37,7 @@ $script:errOffset  = 0
 $script:captured   = $null
 $script:onComplete = $null
 $script:lastExit   = 0
+$script:bucketBytes = 0
 
 # ---------- app icon + desktop shortcut (polish) ----------
 $IconPath = Join-Path $ScriptDir 'valheim-sync.ico'
@@ -318,6 +319,9 @@ function Update-Status($p) {
     } else {
         $lines += "  Cloud : last saved by $($p.uploadedBy), $(Format-Age $p.uploadedAtUtc)"
     }
+    if ($script:bucketBytes -gt 0) {
+        $lines += ("  Bucket: {0:N2} GB used (B2 free tier: 10 GB)" -f ($script:bucketBytes / 1GB))
+    }
     if ($p.hostingPlayer) {
         $lines += ""
         $suffix = if ($p.lockStale) { " - looks abandoned" } else { "" }
@@ -361,6 +365,7 @@ function Load-Worlds {
     Invoke-Action 'Worlds' {
         param($out)
         $w = Parse-Probe $out
+        if ($w -and $w.PSObject.Properties.Name -contains 'bucketBytes') { $script:bucketBytes = [long]$w.bucketBytes }
         $script:loadingWorlds = $true
         $worldCombo.Items.Clear()
         $cur = if ($w) { [string]$w.current } else { '' }
@@ -441,6 +446,12 @@ $updateTimer = New-Object System.Windows.Forms.Timer
 $updateTimer.Interval = 2500
 $updateTimer.Add_Tick({ $updateTimer.Stop(); Check-Update })
 
+# Keep the lock status current without clicking Refresh. 5 min, not faster:
+# every probe downloads the manifest from B2, which has daily free-tier caps.
+$autoTimer = New-Object System.Windows.Forms.Timer
+$autoTimer.Interval = 300000
+$autoTimer.Add_Tick({ if (-not $script:busy) { Refresh-Status } })
+
 # ============================================================
 #  Button behaviour
 # ============================================================
@@ -517,7 +528,7 @@ $btnUpload.Add_Click({
             -not (Confirm-Box "$($p.hostingPlayer) holds the host lock, not you.`r`n`r`nUpload your copy as the new latest anyway?")) { return }
         Invoke-Action 'Upload' {
             param($o)
-            Refresh-Status
+            Load-Worlds   # also refreshes bucket usage + status
             if ($script:lastExit -ne 0) { Info-Box "Upload failed - see the Activity log for details."; return }
             Info-Box "Uploaded! The world is saved to the cloud and the lock is free.`r`n`r`nAnyone can EXTRACT and host next."
         }
@@ -704,6 +715,6 @@ $btnSetup.Add_Click({
 })
 
 # ============================================================
-$form.Add_Shown({ Load-Worlds; $updateTimer.Start() })
-$form.Add_FormClosing({ if ($timer) { $timer.Stop() }; if ($updateTimer) { $updateTimer.Stop() } })
+$form.Add_Shown({ Load-Worlds; $updateTimer.Start(); $autoTimer.Start() })
+$form.Add_FormClosing({ if ($timer) { $timer.Stop() }; if ($updateTimer) { $updateTimer.Stop() }; if ($autoTimer) { $autoTimer.Stop() } })
 [void]$form.ShowDialog()
