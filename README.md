@@ -55,6 +55,10 @@ If someone Extracts and never Uploads (crash, went to bed), their host lock is
 treated as **abandoned after 6 hours** and anyone can take over without the
 scary warning. Change the window via `LockStaleHours` in `config.json`.
 
+While the game is actually running, the watcher **refreshes the lock every
+15 minutes**, so a genuine marathon session is never mistaken for an
+abandoned one — only a lock with no heartbeat for 6+ hours goes stale.
+
 ---
 
 ## Got this from GitHub?
@@ -98,6 +102,10 @@ install.
 
 That's the whole loop. Click **Refresh** any time to see who's hosting.
 
+You don't even have to remember step 2: after an EXTRACT, a background
+watcher waits for Valheim to close and then **pops up "Upload now?"** — click
+Yes and the world is saved and the lock freed, no app window needed.
+
 ## Golden rules (tell your friends)
 1. **EXTRACT before you play, UPLOAD after you play.** Always both.
 2. **Only one person hosts at a time.** The status panel shows the lock —
@@ -110,6 +118,13 @@ That's the whole loop. Click **Refresh** any time to see who's hosting.
 ---
 
 ## Good to know
+- Uploads include Valheim's own `.db.old` / `.fwl.old` rollback copies, and every
+  EXTRACT verifies the download against a SHA-256 checksum before it touches your
+  local save — a corrupted transfer can never overwrite a good world.
+- Setup detects the worlds already on your PC and offers them in a dropdown, so
+  there's no world name to type (or typo).
+- If two people press EXTRACT at nearly the same time, the second one is stopped
+  before taking the lock instead of silently splitting the world.
 - Every UPLOAD keeps a timestamped copy under `valheim/<world>/history/` (use the
   **Restore** button to roll back). History is trimmed to the newest `HistoryKeep`
   saves (default 20) and old file versions are purged each upload, so the bucket
