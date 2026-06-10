@@ -328,22 +328,30 @@ function Do-Extract {
 
     Backup-Local $cfg 'pre-extract'
 
-    Write-Step "Downloading latest world from B2..."
-    $zip = Join-Path $env:TEMP "vsync-latest-$([guid]::NewGuid()).zip"
-    Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', (Get-Remote $cfg 'latest.zip'), $zip, '--progress') | Out-Null
-
-    # Unpack to a temp dir and verify against the manifest hash BEFORE touching
-    # the live save - a truncated/corrupt download must never be installed.
-    $tmpDir = Join-Path $env:TEMP "vsync-extract-$([guid]::NewGuid())"
-    Expand-Archive -Path $zip -DestinationPath $tmpDir -Force
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    if ($m.sha256) {
+    # Download, unpack to a temp dir and verify against the manifest hash BEFORE
+    # touching the live save. A mismatch is retried once (transfer glitch); a
+    # second mismatch means latest.zip and manifest.json genuinely disagree,
+    # i.e. the last upload died between the two writes.
+    $tmpDir = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        Write-Step "Downloading latest world from B2..."
+        $zip = Join-Path $env:TEMP "vsync-latest-$([guid]::NewGuid()).zip"
+        Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', (Get-Remote $cfg 'latest.zip'), $zip, '--progress') | Out-Null
+        $tmpDir = Join-Path $env:TEMP "vsync-extract-$([guid]::NewGuid())"
+        Expand-Archive -Path $zip -DestinationPath $tmpDir -Force
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        if (-not $m.sha256) { break }
         $xdb = Get-ChildItem $tmpDir -File | Where-Object { $_.Name -eq "$($cfg.WorldName).db" } | Select-Object -First 1
-        if ($xdb -and (Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -ne $m.sha256) {
-            Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
-            throw "The downloaded world failed its integrity check (hash mismatch). Your local world was NOT changed - try EXTRACT again."
+        if (-not $xdb -or (Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -eq $m.sha256) {
+            if ($xdb) { Write-Ok "Download verified (SHA256 matches the manifest)." }
+            break
         }
-        Write-Ok "Download verified (SHA256 matches the manifest)."
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        $tmpDir = $null
+        if ($attempt -ge 2) {
+            throw "The cloud world doesn't match its manifest even after a re-download. The last UPLOAD (by $($m.uploadedBy)) was probably interrupted partway - ask them to press UPLOAD again, or use Restore to roll back to an earlier save. Your local world was NOT changed."
+        }
+        Write-Warn2 "Integrity check failed - re-downloading once in case the transfer glitched..."
     }
 
     $worlds = Get-WorldsPath $cfg
