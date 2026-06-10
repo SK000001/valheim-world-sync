@@ -13,9 +13,10 @@ from stale copies and split the world into two diverging timelines.
 ## Download
 
 Grab the latest zip from the [**Releases**](../../releases/latest) page, unzip
-it anywhere, and double-click `Valheim Sync.vbs`. `rclone` downloads itself on
-first run; then click **Setup** to connect your Backblaze bucket. (No
-`config.json` ships in the download — you create yours in Setup.)
+it anywhere, and double-click `Valheim Sync.vbs`. On the first run the **Setup**
+window opens by itself — paste your Backblaze bucket + key and you're done.
+`rclone` downloads itself automatically. (No `config.json` ships in the
+download — you create yours in Setup.)
 
 ## How to use it — just one file
 
@@ -28,8 +29,10 @@ everything you need:
 - **UPLOAD** (blue) — save the world back to the cloud when you're done
 - **World dropdown** (top-right) — switch which world the group syncs, if you
   keep more than one going
-- **Setup** — paste your Backblaze bucket + key (first time only); also adds a
-  Desktop shortcut and lets you set an optional Discord webhook
+- **Setup** — opens by itself on the first run; paste your Backblaze bucket +
+  key, pick your world from a dropdown of the worlds found on your PC, and
+  optionally set a Discord webhook (with a **Test** button). Also adds a
+  Desktop shortcut
 - **Restore** — roll the world back to any earlier save (pick from a list)
 - **Share to friends** — builds a zip on your Desktop to send to friends
 - **Refresh** / **Save folder** — check status, open the Valheim saves folder
@@ -47,10 +50,11 @@ is the only thing you open.)
 
 ### Discord notifications (optional)
 In **Setup**, paste a Discord webhook URL (Server Settings → Integrations →
-Webhooks → New Webhook → Copy URL). The group then gets a ping when someone
-**starts hosting** (🔴) and when the world is **free again** (🟢) — so nobody
-plays on top of someone else. The same URL is shared in the friends zip, so
-everyone posts to the same channel.
+Webhooks → New Webhook → Copy URL) and hit **Test** to confirm it works. The
+group then gets a ping when someone **starts hosting** (🔴, with whose save
+they picked up) and when the world is **free again** (🟢, with session length
+and world size) — so nobody plays on top of someone else. The same URL is
+shared in the friends zip, so everyone posts to the same channel.
 
 ### Abandoned sessions
 If someone Extracts and never Uploads (crash, went to bed), their host lock is
@@ -85,8 +89,9 @@ install.
    - **Buckets → Create a Bucket**, set it **Private**, copy the bucket name.
    - **Application Keys → Add a New Application Key** restricted to that bucket,
      and copy the **keyID** and **applicationKey** (the key shows only once).
-2. **Open the app** (`Valheim Sync.vbs`) → click **Setup** → paste the bucket,
-   keyID, and applicationKey. It downloads `rclone` and tests the connection.
+2. **Open the app** (`Valheim Sync.vbs`) — Setup opens by itself the first
+   time. Paste the bucket, keyID, and applicationKey; it downloads `rclone`
+   and tests the connection.
 3. **Seed the world** → click **UPLOAD** once to put your world in the cloud.
 4. **Share** → click **Share to friends**, then send the
    `ValheimSync-for-friends.zip` from your Desktop to your friends. They unzip
@@ -112,7 +117,8 @@ The status panel refreshes itself every few minutes; click **Refresh** any
 time to see who's hosting right now.
 
 ## Golden rules (tell your friends)
-1. **EXTRACT before you play, UPLOAD after you play.** Always both.
+1. **EXTRACT before you play, UPLOAD after you play.** Always both — or just
+   press **PLAY**, which does both for you.
 2. **Only one person hosts at a time.** The status panel shows the lock —
    coordinate on Discord; whoever holds it is "it".
 3. **Close Valheim fully before UPLOAD/EXTRACT** (the save is locked while the
@@ -146,4 +152,5 @@ time to see who's hosting right now.
 - Each machine keeps its last 10 worlds in `local-backups/` here as a safety net.
 - The shared world is set in `config.json` (`WorldName`) — or just use the **World**
   dropdown in the app.
-- `rclone.exe` lives in `bin/` and is fetched automatically the first time.
+- `rclone.exe` lives in `bin/` and is fetched automatically the first time
+  (a pinned, known-good version).
