@@ -24,11 +24,16 @@ everything you need:
 
 - **EXTRACT** (green) — download the latest world before you play
 - **UPLOAD** (blue) — save the world back to the cloud when you're done
+- **World dropdown** (top-right) — switch which world the group syncs, if you
+  keep more than one going
 - **Setup** — paste your Backblaze bucket + key (first time only); also adds a
   Desktop shortcut and lets you set an optional Discord webhook
 - **Restore** — roll the world back to any earlier save (pick from a list)
 - **Share to friends** — builds a zip on your Desktop to send to friends
 - **Refresh** / **Save folder** — check status, open the Valheim saves folder
+
+The app **checks GitHub for updates** on launch and offers to update itself when
+a new version is released, so you don't have to re-send the zip every time.
 
 The status panel at the top shows who hosted last and whether anyone is
 currently hosting. Pop-up warnings appear if something looks off — e.g. if the
@@ -105,9 +110,15 @@ That's the whole loop. Click **Refresh** any time to see who's hosting.
 ---
 
 ## Good to know
-- Every UPLOAD also keeps a timestamped copy under `valheim/<world>/history/` in
-  the bucket, so a corrupted save can be rolled back from the Backblaze web UI.
+- Every UPLOAD keeps a timestamped copy under `valheim/<world>/history/` (use the
+  **Restore** button to roll back). History is trimmed to the newest `HistoryKeep`
+  saves (default 20) and old file versions are purged each upload, so the bucket
+  stays small and well within B2's free tier.
+- If the world you're about to UPLOAD is much smaller than the cloud copy, the app
+  warns first — protection against uploading a wrong or corrupted world.
+- A host lock older than `LockStaleHours` (default 6) is treated as abandoned, so a
+  forgotten session never blocks the group.
 - Each machine keeps its last 10 worlds in `local-backups/` here as a safety net.
-- The shared world is set in `config.json` (`WorldName`). Change it there or via
-  **Setup** to sync a different world.
+- The shared world is set in `config.json` (`WorldName`) — or just use the **World**
+  dropdown in the app.
 - `rclone.exe` lives in `bin/` and is fetched automatically the first time.

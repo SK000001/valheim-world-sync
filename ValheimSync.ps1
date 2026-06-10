@@ -16,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Extract', 'Upload', 'Status', 'Setup', 'Probe', 'History', 'Restore')]
+    [ValidateSet('Extract', 'Upload', 'Status', 'Setup', 'Probe', 'History', 'Restore', 'Worlds')]
     [string]$Action = 'Status',
     [string]$Item,
     [switch]$Force
@@ -69,6 +69,11 @@ function Get-PlayerName($cfg) {
 function Get-LockStaleHours($cfg) {
     if ($cfg.PSObject.Properties.Name -contains 'LockStaleHours' -and $cfg.LockStaleHours) { return [double]$cfg.LockStaleHours }
     return 6
+}
+
+function Get-HistoryKeep($cfg) {
+    if ($cfg.PSObject.Properties.Name -contains 'HistoryKeep' -and $cfg.HistoryKeep) { return [int]$cfg.HistoryKeep }
+    return 20
 }
 
 # True if a held lock is older than the stale threshold (likely an abandoned session).
@@ -160,6 +165,28 @@ function Set-Manifest($exe, $cfg, $manifest) {
     $manifest | ConvertTo-Json -Depth 6 | Set-Content $tmp -Encoding UTF8
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $tmp, $remote) | Out-Null
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
+
+# Keep the bucket lean: drop old hidden file versions, and trim history/ to the
+# newest HistoryKeep saves. Best-effort - never blocks an upload.
+function Invoke-StorageCleanup($exe, $cfg) {
+    try {
+        $worldRemote = ":b2:$($cfg.B2.Bucket)/valheim/$($cfg.WorldName)"
+        # purge superseded versions of the repeatedly-overwritten files (latest.zip, manifest.json)
+        Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('cleanup', $worldRemote) -AllowFail | Out-Null
+        # trim history to the newest N
+        $keep = Get-HistoryKeep $cfg
+        $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsf', "$worldRemote/history/") -AllowFail
+        if ($r.Code -eq 0 -and $r.Output) {
+            $files = @($r.Output -split "`r?`n" | Where-Object { $_ -match '\.zip$' } | Sort-Object -Descending)
+            if ($files.Count -gt $keep) {
+                foreach ($old in ($files | Select-Object -Skip $keep)) {
+                    Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('deletefile', "$worldRemote/history/$old") -AllowFail | Out-Null
+                }
+                Write-Ok "Trimmed history to the newest $keep saves."
+            }
+        }
+    } catch { Write-Warn2 "(cleanup skipped - $($_.Exception.Message))" }
 }
 
 function Format-Age($utcString) {
@@ -337,6 +364,17 @@ function Do-Upload {
         }
     }
 
+    # Size-sanity guard: uploading a much smaller world usually means the wrong
+    # world or a corrupted save - flag it before it overwrites a bigger cloud one.
+    if ($m -and $m.dbSize -and $m.dbSize -gt 204800) {
+        $localSize = (Get-Item $db).Length
+        if ($localSize -lt ($m.dbSize * 0.5)) {
+            Write-Warn2 ("The world you're uploading ({0:N1} MB) is much smaller than the cloud copy ({1:N1} MB)." -f ($localSize / 1MB), ($m.dbSize / 1MB))
+            Write-Warn2 "That can mean a wrong or corrupted world. Double-check before overwriting."
+            if (-not (Confirm-Action "Upload the smaller world anyway?")) { throw "Aborted - looked like a wrong/corrupted world." }
+        }
+    }
+
     # Warn if someone else holds the lock (you're uploading over their turn)
     if ($m -and $m.hosting -and $m.hosting.player -and $m.hosting.player -ne $me) {
         Write-Warn2 "Heads up: $($m.hosting.player) holds the host lock, not you."
@@ -369,6 +407,7 @@ function Do-Upload {
     Set-Manifest $exe $cfg $manifest
     Write-Ok "World uploaded. Lock released - anyone can EXTRACT and host next."
     Send-Discord $cfg ":green_circle: **$me** finished playing **$($cfg.WorldName)** - world is free to host."
+    Invoke-StorageCleanup $exe $cfg
     Write-Host ''
 }
 
@@ -431,7 +470,7 @@ function Emit-Probe($h) {
 }
 
 function Do-Probe {
-    $r = [ordered]@{ configured = $false; cloudEmpty = $false; localExists = $false; localNewer = $false; cloudNewer = $false; lockStale = $false; gameRunning = $false }
+    $r = [ordered]@{ configured = $false; cloudEmpty = $false; localExists = $false; localNewer = $false; cloudNewer = $false; lockStale = $false; gameRunning = $false; cloudDbSize = 0; localDbSize = 0 }
     try {
         if (-not (Test-Path $ConfigPath)) { Emit-Probe $r; return }
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
@@ -441,6 +480,7 @@ function Do-Probe {
         $r.gameRunning = [bool]$procs
         $db = Get-LocalDb $cfg
         $r.localExists = Test-Path $db
+        if ($r.localExists) { $r.localDbSize = (Get-Item $db).Length }
         $hasCreds = $cfg.B2.KeyId -and $cfg.B2.KeyId -ne 'PASTE_KEY_ID_HERE' -and $cfg.B2.Bucket
         $r.configured = [bool]$hasCreds
         if (-not $hasCreds) { Emit-Probe $r; return }
@@ -449,6 +489,7 @@ function Do-Probe {
         if (-not $m) { $r.cloudEmpty = $true; Emit-Probe $r; return }
         $r.uploadedBy = $m.uploadedBy
         $r.uploadedAtUtc = $m.uploadedAtUtc
+        if ($m.dbSize) { $r.cloudDbSize = $m.dbSize }
         if ($m.hosting -and $m.hosting.player) {
             $r.hostingPlayer = $m.hosting.player
             $r.hostingSinceUtc = $m.hosting.sinceUtc
@@ -533,6 +574,25 @@ function Do-Restore {
     Write-Host ''
 }
 
+# Machine-readable list of worlds that exist in the cloud bucket, for the GUI dropdown.
+function Do-Worlds {
+    $worlds = @()
+    $current = ''
+    try {
+        $cfg = Get-Config
+        $current = $cfg.WorldName
+        $exe = Ensure-Rclone
+        $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsf', '--dirs-only', ":b2:$($cfg.B2.Bucket)/valheim/") -AllowFail
+        if ($r.Code -eq 0 -and $r.Output) {
+            foreach ($d in ($r.Output -split "`r?`n")) {
+                $name = $d.Trim().TrimEnd('/')
+                if ($name) { $worlds += $name }
+            }
+        }
+    } catch {}
+    Emit-Probe ([ordered]@{ worlds = @($worlds | Sort-Object -Unique); current = $current })
+}
+
 # ============================================================
 try {
     switch ($Action) {
@@ -543,6 +603,7 @@ try {
         'Probe'   { Do-Probe }
         'History' { Do-History }
         'Restore' { Do-Restore }
+        'Worlds'  { Do-Worlds }
     }
 } catch {
     Write-Host ''

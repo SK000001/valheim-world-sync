@@ -11,9 +11,13 @@ Add-Type -AssemblyName System.Drawing
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $MainScript = Join-Path $ScriptDir 'ValheimSync.ps1'
 $ConfigPath = Join-Path $ScriptDir 'config.json'
+$RepoSlug   = 'SK000001/valheim-world-sync'
+$VersionFile = Join-Path $ScriptDir 'VERSION'
+$AppVersion = if (Test-Path $VersionFile) { (Get-Content $VersionFile -Raw).Trim() } else { '1.0' }
 
 # ---------- async runner state ----------
-$script:busy       = $false
+$script:busy        = $false
+$script:loadingWorlds = $false
 $script:proc       = $null
 $script:outFile    = $null
 $script:errFile    = $null
@@ -66,7 +70,7 @@ function New-DesktopShortcut {
 #  Window
 # ============================================================
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'Valheim Sync'
+$form.Text = "Valheim Sync v$AppVersion"
 $form.Size = New-Object System.Drawing.Size(560, 560)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
@@ -81,8 +85,25 @@ $title.Text = 'Valheim Sync'
 $title.ForeColor = [System.Drawing.Color]::White
 $title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
 $title.Location = New-Object System.Drawing.Point(20, 14)
-$title.Size = New-Object System.Drawing.Size(400, 30)
+$title.Size = New-Object System.Drawing.Size(250, 30)
 $form.Controls.Add($title)
+
+# world selector (top-right)
+$worldLabel = New-Object System.Windows.Forms.Label
+$worldLabel.Text = 'World'
+$worldLabel.ForeColor = [System.Drawing.Color]::Gray
+$worldLabel.Location = New-Object System.Drawing.Point(332, 22)
+$worldLabel.Size = New-Object System.Drawing.Size(44, 18)
+$form.Controls.Add($worldLabel)
+
+$worldCombo = New-Object System.Windows.Forms.ComboBox
+$worldCombo.Location = New-Object System.Drawing.Point(378, 18)
+$worldCombo.Size = New-Object System.Drawing.Size(150, 24)
+$worldCombo.DropDownStyle = 'DropDownList'
+$worldCombo.FlatStyle = 'Flat'
+$worldCombo.BackColor = [System.Drawing.Color]::FromArgb(22, 24, 28)
+$worldCombo.ForeColor = [System.Drawing.Color]::Gainsboro
+$form.Controls.Add($worldCombo)
 
 # status panel
 $statusBox = New-Object System.Windows.Forms.Label
@@ -302,6 +323,84 @@ function Refresh-Status {
     Invoke-Action 'Probe' { param($out) Update-Status (Parse-Probe $out) }
 }
 
+function Set-WorldName([string]$name) {
+    try {
+        $c = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        if ($c.WorldName -ne $name) {
+            $c.WorldName = $name
+            ($c | ConvertTo-Json -Depth 6) | Set-Content $ConfigPath -Encoding UTF8
+            Append-Log "Switched to world '$name'."
+            Refresh-Status
+        }
+    } catch { Info-Box "Couldn't switch world: $($_.Exception.Message)" }
+}
+
+function Load-Worlds {
+    Invoke-Action 'Worlds' {
+        param($out)
+        $w = Parse-Probe $out
+        $script:loadingWorlds = $true
+        $worldCombo.Items.Clear()
+        $cur = if ($w) { [string]$w.current } else { '' }
+        $names = @()
+        if ($w -and $w.worlds) { $names = @($w.worlds) }
+        if ($cur -and ($names -notcontains $cur)) { $names = @($cur) + $names }
+        foreach ($n in $names) { [void]$worldCombo.Items.Add($n) }
+        if ($cur -and $worldCombo.Items.Contains($cur)) { $worldCombo.SelectedItem = $cur }
+        elseif ($worldCombo.Items.Count -gt 0) { $worldCombo.SelectedIndex = 0 }
+        $script:loadingWorlds = $false
+        Refresh-Status
+    }
+}
+
+$worldCombo.Add_SelectedIndexChanged({
+    if ($script:loadingWorlds) { return }
+    if ($worldCombo.SelectedItem) { Set-WorldName ([string]$worldCombo.SelectedItem) }
+})
+
+# ---------- auto-update from GitHub ----------
+function Install-Update([string]$url) {
+    try {
+        Append-Log "Downloading update..."
+        $tmpzip = Join-Path $env:TEMP ("vsync-update-" + [guid]::NewGuid() + ".zip")
+        Invoke-WebRequest -Uri $url -OutFile $tmpzip -UseBasicParsing
+        $tmpdir = Join-Path $env:TEMP ("vsync-update-" + [guid]::NewGuid())
+        Expand-Archive -Path $tmpzip -DestinationPath $tmpdir -Force
+        $root = Get-ChildItem $tmpdir -Directory | Select-Object -First 1
+        $src = if ($root) { $root.FullName } else { $tmpdir }
+        Get-ChildItem $src -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($src.Length).TrimStart('\', '/')
+            if ($rel -ieq 'config.json') { return }   # never touch the user's key/config
+            $dest = Join-Path $ScriptDir $rel
+            $destDir = Split-Path $dest -Parent
+            if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+            Copy-Item $_.FullName $dest -Force
+        }
+        Info-Box "Updated! Click OK to close Valheim Sync, then reopen it to use the new version."
+        $form.Close()
+    } catch {
+        Info-Box "Update failed: $($_.Exception.Message)"
+    }
+}
+
+function Check-Update {
+    try {
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers @{ 'User-Agent' = 'valheim-sync' } -TimeoutSec 8
+        $latest = ($rel.tag_name -replace '^v', '')
+        if (-not $latest) { return }
+        if ([version]$latest -gt [version]$AppVersion) {
+            $asset = $rel.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
+            if ($asset -and (Confirm-Box "A new version is available: v$latest (you have v$AppVersion).`r`n`r`nDownload and install it now? Your config and saves are kept.")) {
+                Install-Update $asset.browser_download_url
+            }
+        }
+    } catch {}
+}
+
+$updateTimer = New-Object System.Windows.Forms.Timer
+$updateTimer.Interval = 2500
+$updateTimer.Add_Tick({ $updateTimer.Stop(); Check-Update })
+
 # ============================================================
 #  Button behaviour
 # ============================================================
@@ -339,6 +438,8 @@ $btnUpload.Add_Click({
         if ($p.gameRunning -and -not (Confirm-Box "Valheim appears to be running. Close it fully first.`r`n`r`nContinue anyway?")) { return }
         if ($p.cloudNewer -and
             -not (Confirm-Box "The cloud world (saved by $($p.uploadedBy)) is NEWER than your local copy.`r`n`r`nUploading now would overwrite their progress - did you forget to EXTRACT first?`r`n`r`nUpload anyway and overwrite it?")) { return }
+        if ($p.cloudDbSize -gt 204800 -and $p.localDbSize -gt 0 -and $p.localDbSize -lt ($p.cloudDbSize * 0.5) -and
+            -not (Confirm-Box ("The world you're uploading is much smaller than the cloud copy ({0:N1} MB vs {1:N1} MB).`r`n`r`nThat can mean a wrong or corrupted world. Upload anyway?" -f ($p.localDbSize / 1MB), ($p.cloudDbSize / 1MB)))) { return }
         if ($p.hostingPlayer -and $p.hostingPlayer -ne $p.me -and
             -not (Confirm-Box "$($p.hostingPlayer) holds the host lock, not you.`r`n`r`nUpload your copy as the new latest anyway?")) { return }
         Invoke-Action 'Upload' {
@@ -484,16 +585,17 @@ $btnSetup.Add_Click({
             Player         = $tPlayer.Text
             DiscordWebhook = $tDiscord.Text
             LockStaleHours = $(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'LockStaleHours' -and $cfg.LockStaleHours) { $cfg.LockStaleHours } else { 6 })
+            HistoryKeep    = $(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'HistoryKeep' -and $cfg.HistoryKeep) { $cfg.HistoryKeep } else { 20 })
             B2             = [pscustomobject]@{ Bucket = $tBucket.Text; KeyId = $tKey.Text; AppKey = $tApp.Text }
         }
         $new | ConvertTo-Json -Depth 6 | Set-Content $ConfigPath -Encoding UTF8
         Append-Log "Saved config.json - testing connection..."
         if (New-DesktopShortcut) { Append-Log "Created a 'Valheim Sync' shortcut on your Desktop." }
-        Refresh-Status
+        Load-Worlds
     }
 })
 
 # ============================================================
-$form.Add_Shown({ Refresh-Status })
-$form.Add_FormClosing({ if ($timer) { $timer.Stop() } })
+$form.Add_Shown({ Load-Worlds; $updateTimer.Start() })
+$form.Add_FormClosing({ if ($timer) { $timer.Stop() }; if ($updateTimer) { $updateTimer.Stop() } })
 [void]$form.ShowDialog()
