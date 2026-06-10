@@ -22,6 +22,8 @@ first run; then click **Setup** to connect your Backblaze bucket. (No
 Double-click **`Valheim Sync.vbs`**. That opens the app — a window with
 everything you need:
 
+- **PLAY** (big green bar) — one click: downloads the latest world, launches
+  Valheim via Steam, then asks to upload when you close the game
 - **EXTRACT** (green) — download the latest world before you play
 - **UPLOAD** (blue) — save the world back to the cloud when you're done
 - **World dropdown** (top-right) — switch which world the group syncs, if you
@@ -97,14 +99,17 @@ install.
 
 ## Everyday use
 
+Click **PLAY**. That's it — it downloads the latest world, launches Valheim,
+and when you close the game a pop-up asks **"Upload now?"** — click Yes and
+the world is saved and the lock freed.
+
+Prefer the manual loop? Same as ever:
+
 1. **Before you play:** click **EXTRACT** → start Valheim → host the world.
 2. **When you're done:** fully close Valheim → click **UPLOAD**.
 
-That's the whole loop. Click **Refresh** any time to see who's hosting.
-
-You don't even have to remember step 2: after an EXTRACT, a background
-watcher waits for Valheim to close and then **pops up "Upload now?"** — click
-Yes and the world is saved and the lock freed, no app window needed.
+The status panel refreshes itself every few minutes; click **Refresh** any
+time to see who's hosting right now.
 
 ## Golden rules (tell your friends)
 1. **EXTRACT before you play, UPLOAD after you play.** Always both.
@@ -118,6 +123,11 @@ Yes and the world is saved and the lock freed, no app window needed.
 ---
 
 ## Good to know
+- The status panel shows the bucket's total size against B2's 10 GB free tier,
+  and `vsync.log` (next to the app) records everything the background watcher
+  did — handy if an upload prompt never appeared.
+- **Restore** can also roll back from this PC's `local-backups/` ("From this
+  PC..." button) — that replaces only your local world, the cloud is untouched.
 - Uploads include Valheim's own `.db.old` / `.fwl.old` rollback copies, and every
   EXTRACT verifies the download against a SHA-256 checksum before it touches your
   local save — a corrupted transfer can never overwrite a good world.
