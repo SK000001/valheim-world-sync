@@ -8,6 +8,17 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# single instance: a second double-click just tells you it's already open
+$script:singleInstance = New-Object System.Threading.Mutex($false, 'Local\ValheimSyncGui')
+$gotMutex = $false
+try { $gotMutex = $script:singleInstance.WaitOne(0, $false) }
+catch [System.Threading.AbandonedMutexException] { $gotMutex = $true }
+if (-not $gotMutex) {
+    [System.Windows.Forms.MessageBox]::Show('Valheim Sync is already open - check your taskbar.', 'Valheim Sync',
+        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    exit
+}
+
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $MainScript = Join-Path $ScriptDir 'ValheimSync.ps1'
 $ConfigPath = Join-Path $ScriptDir 'config.json'
@@ -315,6 +326,8 @@ function Update-Status($p) {
     }
     if ($p.localExists -and $p.localNewer) {
         $lines += "  Note  : your local copy looks NEWER - UPLOAD it if you just played"
+    } elseif ($p.localExists -and $p.cloudNewer) {
+        $lines += "  Note  : the cloud copy is NEWER - EXTRACT before you play"
     }
     $statusBox.Text = ($lines -join "`r`n")
 }
