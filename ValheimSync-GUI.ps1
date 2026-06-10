@@ -36,6 +36,7 @@ $script:outOffset  = 0
 $script:errOffset  = 0
 $script:captured   = $null
 $script:onComplete = $null
+$script:lastExit   = 0
 
 # ---------- app icon + desktop shortcut (polish) ----------
 $IconPath = Join-Path $ScriptDir 'valheim-sync.ico'
@@ -128,11 +129,11 @@ $statusBox.Padding = New-Object System.Windows.Forms.Padding(10)
 $statusBox.Text = "  Loading status..."
 $form.Controls.Add($statusBox)
 
-function New-BigButton($text, $x, $y, $w, $color) {
+function New-BigButton($text, $x, $y, $w, $h, $color) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
     $b.Location = New-Object System.Drawing.Point($x, $y)
-    $b.Size = New-Object System.Drawing.Size($w, 64)
+    $b.Size = New-Object System.Drawing.Size($w, $h)
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
     $b.BackColor = $color
@@ -143,13 +144,16 @@ function New-BigButton($text, $x, $y, $w, $color) {
     return $b
 }
 
-$btnExtract = New-BigButton "1. EXTRACT`r`n(before you play)" 20 196 248 ([System.Drawing.Color]::FromArgb(46, 125, 50))
-$btnUpload  = New-BigButton "2. UPLOAD`r`n(after you play)"  280 196 248 ([System.Drawing.Color]::FromArgb(21, 101, 192))
+$btnPlay = New-BigButton "PLAY  -  get the latest world, launch Valheim, upload after" 20 196 508 56 ([System.Drawing.Color]::FromArgb(76, 175, 80))
+$btnExtract = New-BigButton "1. EXTRACT (before you play)" 20 260 248 40 ([System.Drawing.Color]::FromArgb(46, 125, 50))
+$btnExtract.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
+$btnUpload  = New-BigButton "2. UPLOAD (after you play)"  280 260 248 40 ([System.Drawing.Color]::FromArgb(21, 101, 192))
+$btnUpload.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
 
 function New-SmallButton($text, $x, $w) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
-    $b.Location = New-Object System.Drawing.Point($x, 272)
+    $b.Location = New-Object System.Drawing.Point($x, 308)
     $b.Size = New-Object System.Drawing.Size($w, 30)
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
@@ -170,13 +174,13 @@ $btnOpen    = New-SmallButton 'Save folder'      420 108
 $logLabel = New-Object System.Windows.Forms.Label
 $logLabel.Text = 'Activity'
 $logLabel.ForeColor = [System.Drawing.Color]::Gray
-$logLabel.Location = New-Object System.Drawing.Point(20, 314)
+$logLabel.Location = New-Object System.Drawing.Point(20, 348)
 $logLabel.Size = New-Object System.Drawing.Size(200, 18)
 $form.Controls.Add($logLabel)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = New-Object System.Drawing.Point(20, 334)
-$log.Size = New-Object System.Drawing.Size(508, 178)
+$log.Location = New-Object System.Drawing.Point(20, 368)
+$log.Size = New-Object System.Drawing.Size(508, 144)
 $log.Multiline = $true
 $log.ReadOnly = $true
 $log.ScrollBars = 'Vertical'
@@ -196,6 +200,7 @@ function Append-Log([string]$text) {
 }
 
 function Set-Buttons([bool]$on) {
+    $btnPlay.Enabled = $on
     $btnExtract.Enabled = $on
     $btnUpload.Enabled = $on
     $btnRefresh.Enabled = $on
@@ -246,6 +251,7 @@ $timer.Add_Tick({
         $timer.Stop()
         $full = $script:captured.ToString()
         $cb = $script:onComplete
+        $script:lastExit = $script:proc.ExitCode
         Remove-Item $script:outFile, $script:errFile -Force -ErrorAction SilentlyContinue
         $script:proc = $null
         $script:busy = $false
@@ -371,6 +377,24 @@ $worldCombo.Add_SelectedIndexChanged({
     if ($worldCombo.SelectedItem) { Set-WorldName ([string]$worldCombo.SelectedItem) }
 })
 
+# ---------- PLAY helpers ----------
+function Start-Game {
+    try {
+        Start-Process 'steam://rungameid/892970'
+        Append-Log 'Launching Valheim via Steam...'
+    } catch { Info-Box "Couldn't launch Valheim via Steam - start the game yourself, then play as normal." }
+}
+
+# Spawn the engine's background watcher directly (used when PLAY skips the
+# extract; an extract starts its own watcher).
+function Start-SessionWatcher {
+    try {
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+            '-File', $MainScript, '-Action', 'Watch') | Out-Null
+    } catch {}
+}
+
 # ---------- auto-update from GitHub ----------
 function Install-Update([string]$url) {
     try {
@@ -417,6 +441,38 @@ $updateTimer.Add_Tick({ $updateTimer.Stop(); Check-Update })
 # ============================================================
 #  Button behaviour
 # ============================================================
+$btnPlay.Add_Click({
+    Invoke-Action 'Probe' {
+        param($out)
+        $p = Parse-Probe $out
+        Update-Status $p
+        if (-not $p) { Info-Box "Couldn't read the cloud status. Check your internet and try Refresh."; return }
+        if (-not $p.configured) { Info-Box "Not set up yet. Click 'Setup' first."; return }
+        if ($p.cloudEmpty) { Info-Box "There is no world in the cloud yet. Someone needs to press UPLOAD first."; return }
+        if ($p.gameRunning) { Info-Box "Valheim is already running."; return }
+        # Resume your own session: you hold the lock and your local copy is the
+        # newest, so there is nothing to download - just play on.
+        if ($p.hostingPlayer -eq $p.me -and $p.localNewer) {
+            Append-Log "Resuming your session (your local copy is newest) - skipping the extract."
+            Start-SessionWatcher
+            Start-Game
+            return
+        }
+        if ($p.hostingPlayer -and $p.hostingPlayer -ne $p.me -and -not $p.lockStale -and
+            -not (Confirm-Box "$($p.hostingPlayer) is currently hosting.`r`n`r`nIf you both host, the world will split into two copies. Take over anyway?")) { return }
+        if ($p.hostingPlayer -and $p.hostingPlayer -ne $p.me -and $p.lockStale -and
+            -not (Confirm-Box "$($p.hostingPlayer)'s session looks abandoned (lock is old).`r`n`r`nTake over and host?")) { return }
+        if ($p.localNewer -and
+            -not (Confirm-Box "Your local copy looks NEWER than the cloud.`r`n`r`nExtracting will overwrite it with the (older) cloud copy. Continue?")) { return }
+        Invoke-Action 'Extract' {
+            param($o)
+            if ($script:lastExit -ne 0) { Refresh-Status; Info-Box "Extract failed - see the Activity log. The game was not launched."; return }
+            Refresh-Status
+            Start-Game
+        }
+    }
+})
+
 $btnExtract.Add_Click({
     Invoke-Action 'Probe' {
         param($out)
@@ -435,6 +491,7 @@ $btnExtract.Add_Click({
         Invoke-Action 'Extract' {
             param($o)
             Refresh-Status
+            if ($script:lastExit -ne 0) { Info-Box "Extract failed - see the Activity log for details."; return }
             Info-Box "Done! The world is downloaded and you're marked as host.`r`n`r`nStart Valheim and host the world. When you close the game, you'll be asked whether to upload right away (or press UPLOAD here)."
         }
     }
@@ -458,6 +515,7 @@ $btnUpload.Add_Click({
         Invoke-Action 'Upload' {
             param($o)
             Refresh-Status
+            if ($script:lastExit -ne 0) { Info-Box "Upload failed - see the Activity log for details."; return }
             Info-Box "Uploaded! The world is saved to the cloud and the lock is free.`r`n`r`nAnyone can EXTRACT and host next."
         }
     }
@@ -520,6 +578,7 @@ $btnRestore.Add_Click({
             Invoke-Action 'Restore' {
                 param($o)
                 Refresh-Status
+                if ($script:lastExit -ne 0) { Info-Box "Restore failed - see the Activity log for details."; return }
                 Info-Box "Restored. It's now the current world.`r`n`r`nClick EXTRACT to download the restored save."
             } @('-Item', $chosen)
         }
