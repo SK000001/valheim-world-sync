@@ -671,7 +671,7 @@ function Get-DetectedWorlds {
 }
 
 # ---------- Setup dialog ----------
-$btnSetup.Add_Click({
+function Show-SetupDialog {
     $cfg = $null
     if (Test-Path $ConfigPath) { try { $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json } catch {} }
 
@@ -721,6 +721,22 @@ $btnSetup.Add_Click({
     $tPlayer = Add-Field 'Your name (host lock)' 206 ($(if($cfg -and $cfg.Player){$cfg.Player}else{$env:USERNAME})) $false
     $existingHook = if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'DiscordWebhook')) { $cfg.DiscordWebhook } else { '' }
     $tDiscord = Add-Field 'Discord webhook URL (optional)' 254 $existingHook $false
+    $tDiscord.Size = New-Object System.Drawing.Size(300, 24)
+    $testBtn = New-Object System.Windows.Forms.Button
+    $testBtn.Text = 'Test'
+    $testBtn.Location = New-Object System.Drawing.Point(328, 273); $testBtn.Size = New-Object System.Drawing.Size(72, 26)
+    $testBtn.FlatStyle = 'Flat'; $testBtn.BackColor = [System.Drawing.Color]::FromArgb(55, 58, 66); $testBtn.ForeColor = 'Gainsboro'
+    $testBtn.Tag = $tDiscord   # $this.Tag = the textbox, scope-safe in the handler
+    $testBtn.Add_Click({
+        $hook = $this.Tag.Text.Trim()
+        if (-not $hook) { Info-Box "Paste a Discord webhook URL first."; return }
+        try {
+            Invoke-RestMethod -Method Post -Uri $hook -ContentType 'application/json' `
+                -Body (@{ content = 'Valheim Sync: webhook test - it works!' } | ConvertTo-Json) -TimeoutSec 10 | Out-Null
+            Info-Box "Sent! Check the Discord channel."
+        } catch { Info-Box "Test failed: $($_.Exception.Message)" }
+    })
+    $dlg.Controls.Add($testBtn)
 
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = 'Save & Test'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
@@ -753,9 +769,20 @@ $btnSetup.Add_Click({
         if (New-DesktopShortcut) { Append-Log "Created a 'Valheim Sync' shortcut on your Desktop." }
         Load-Worlds
     }
-})
+}
+
+$btnSetup.Add_Click({ Show-SetupDialog })
 
 # ============================================================
-$form.Add_Shown({ Load-Worlds; $updateTimer.Start(); $autoTimer.Start() })
+$form.Add_Shown({
+    if (Test-Path $ConfigPath) {
+        Load-Worlds
+    } else {
+        # first run: open Setup straight away instead of a hint in the status box
+        Show-SetupDialog   # calls Load-Worlds itself after a successful save
+        if (-not (Test-Path $ConfigPath)) { Refresh-Status }
+    }
+    $updateTimer.Start(); $autoTimer.Start()
+})
 $form.Add_FormClosing({ if ($timer) { $timer.Stop() }; if ($updateTimer) { $updateTimer.Stop() }; if ($autoTimer) { $autoTimer.Stop() } })
 [void]$form.ShowDialog()
