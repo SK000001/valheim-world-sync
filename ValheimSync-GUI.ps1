@@ -516,8 +516,14 @@ $btnRestore.Add_Click({
 $btnShare.Add_Click({
     if (-not (Confirm-Box "This builds a zip on your Desktop (with your B2 key inside) to send to friends.`r`n`r`nOnly share it with people you trust to play on the world. Continue?")) { return }
     $pkg = Join-Path $ScriptDir 'Package.ps1'
+    if (-not (Test-Path $pkg)) { Info-Box "Package.ps1 is missing from this folder - re-download Valheim Sync."; return }
+    $dest = Join-Path ([Environment]::GetFolderPath('Desktop')) 'ValheimSync-for-friends.zip'
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pkg | Out-Null
-    Info-Box "Created 'ValheimSync-for-friends.zip' on your Desktop.`r`n`r`nSend it to your friends - they unzip it and double-click 'Valheim Sync.vbs'."
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $dest)) {
+        Info-Box "Created 'ValheimSync-for-friends.zip' on your Desktop.`r`n`r`nSend it to your friends - they unzip it and double-click 'Valheim Sync.vbs'."
+    } else {
+        Info-Box "Couldn't build the zip (exit code $LASTEXITCODE). Try running Package.ps1 in a PowerShell window to see the error."
+    }
 })
 
 $btnOpen.Add_Click({

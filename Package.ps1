@@ -7,9 +7,12 @@ $temp = Join-Path $env:TEMP ('vsync-pkg-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path (Join-Path $temp 'ValheimSync') | Out-Null
 $stage = Join-Path $temp 'ValheimSync'
 
+# VERSION must ship or fresh installs report v1.0 and instantly prompt to
+# update; Package.ps1 must ship or friends can't "Share to friends" onward.
 $include = @(
     'ValheimSync.ps1', 'ValheimSync-GUI.ps1', 'config.json', 'README.md',
-    'Valheim Sync.vbs', 'valheim-sync.ico'
+    'Valheim Sync.vbs', 'valheim-sync.ico', 'VERSION', 'Package.ps1',
+    'config.example.json'
 )
 foreach ($f in $include) {
     $p = Join-Path $src $f
