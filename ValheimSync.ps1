@@ -215,6 +215,12 @@ function Get-LocalDb($cfg) {
     Join-Path $worlds "$($cfg.WorldName).db"
 }
 
+# The world's files worth syncing: .db + .fwl, plus Valheim's own .old rollback
+# copies when present - they let the game recover from a mid-write/corrupted .db.
+function Get-WorldFiles($db, $fwl) {
+    @($db, $fwl) + @(@("$db.old", "$fwl.old") | Where-Object { Test-Path $_ })
+}
+
 function Backup-Local($cfg, $tag) {
     $worlds = Get-WorldsPath $cfg
     $db = Join-Path $worlds "$($cfg.WorldName).db"
@@ -224,7 +230,7 @@ function Backup-Local($cfg, $tag) {
     if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir | Out-Null }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $dest = Join-Path $backupDir "$($cfg.WorldName)_$tag`_$stamp.zip"
-    Compress-Archive -Path @($db, $fwl) -DestinationPath $dest -Force
+    Compress-Archive -Path (Get-WorldFiles $db $fwl) -DestinationPath $dest -Force
     # keep only the newest 10 local backups
     Get-ChildItem $backupDir -Filter "$($cfg.WorldName)_*.zip" |
         Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
@@ -316,11 +322,25 @@ function Do-Extract {
     $zip = Join-Path $env:TEMP "vsync-latest-$([guid]::NewGuid()).zip"
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', (Get-Remote $cfg 'latest.zip'), $zip, '--progress') | Out-Null
 
+    # Unpack to a temp dir and verify against the manifest hash BEFORE touching
+    # the live save - a truncated/corrupt download must never be installed.
+    $tmpDir = Join-Path $env:TEMP "vsync-extract-$([guid]::NewGuid())"
+    Expand-Archive -Path $zip -DestinationPath $tmpDir -Force
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    if ($m.sha256) {
+        $xdb = Get-ChildItem $tmpDir -File | Where-Object { $_.Name -eq "$($cfg.WorldName).db" } | Select-Object -First 1
+        if ($xdb -and (Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -ne $m.sha256) {
+            Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+            throw "The downloaded world failed its integrity check (hash mismatch). Your local world was NOT changed - try EXTRACT again."
+        }
+        Write-Ok "Download verified (SHA256 matches the manifest)."
+    }
+
     $worlds = Get-WorldsPath $cfg
     if (-not (Test-Path $worlds)) { New-Item -ItemType Directory -Path $worlds | Out-Null }
     Write-Step "Installing into $worlds ..."
-    Expand-Archive -Path $zip -DestinationPath $worlds -Force
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    Copy-Item (Join-Path $tmpDir '*') $worlds -Force
+    Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Ok "World '$($cfg.WorldName)' is ready to play."
 
     # Claim the lock - it's your turn to host.
@@ -383,7 +403,7 @@ function Do-Upload {
 
     Write-Step "Packing $($cfg.WorldName).db + .fwl ..."
     $zip = Join-Path $env:TEMP "vsync-upload-$([guid]::NewGuid()).zip"
-    Compress-Archive -Path @($db, $fwl) -DestinationPath $zip -Force
+    Compress-Archive -Path (Get-WorldFiles $db $fwl) -DestinationPath $zip -Force
     $hash = (Get-FileHash $db -Algorithm SHA256).Hash
 
     Write-Step "Uploading to B2..."
