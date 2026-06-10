@@ -422,7 +422,7 @@ $btnExtract.Add_Click({
         Invoke-Action 'Extract' {
             param($o)
             Refresh-Status
-            Info-Box "Done! The world is downloaded and you're marked as host.`r`n`r`nStart Valheim and host the world. Press UPLOAD when you finish."
+            Info-Box "Done! The world is downloaded and you're marked as host.`r`n`r`nStart Valheim and host the world. When you close the game, you'll be asked whether to upload right away (or press UPLOAD here)."
         }
     }
 })

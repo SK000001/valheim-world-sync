@@ -16,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Extract', 'Upload', 'Status', 'Setup', 'Probe', 'History', 'Restore', 'Worlds')]
+    [ValidateSet('Extract', 'Upload', 'Status', 'Setup', 'Probe', 'History', 'Restore', 'Worlds', 'Watch')]
     [string]$Action = 'Status',
     [string]$Item,
     [switch]$Force
@@ -77,10 +77,14 @@ function Get-HistoryKeep($cfg) {
 }
 
 # True if a held lock is older than the stale threshold (likely an abandoned session).
+# The session watcher refreshes hosting.heartbeatUtc while the game runs, so a
+# genuine marathon session is judged by its last heartbeat, not its start time.
 function Test-LockStale($m, $cfg) {
     if (-not $m -or -not $m.hosting -or -not $m.hosting.sinceUtc) { return $false }
     try {
-        $since = [datetime]::Parse($m.hosting.sinceUtc).ToUniversalTime()
+        $ts = $m.hosting.sinceUtc
+        if ($m.hosting.PSObject.Properties.Name -contains 'heartbeatUtc' -and $m.hosting.heartbeatUtc) { $ts = $m.hosting.heartbeatUtc }
+        $since = [datetime]::Parse($ts).ToUniversalTime()
         return ((Get-Date).ToUniversalTime() - $since).TotalHours -gt (Get-LockStaleHours $cfg)
     } catch { return $false }
 }
@@ -369,9 +373,105 @@ function Do-Extract {
     Set-Manifest $exe $cfg $m
     Write-Ok "Lock claimed - you're marked as the host."
     Send-Discord $cfg ":red_circle: **$me** is now hosting **$($cfg.WorldName)** - world is in use (picking up $($m.uploadedBy)'s save from $(Format-Age $m.uploadedAtUtc))."
+    Start-Watcher
     Write-Host ''
     Write-Host "  >> Host the world in-game now. When you're done, press UPLOAD. <<" -ForegroundColor Cyan
+    Write-Host "  >> (When Valheim closes, you'll be asked if you want to upload right away.) <<" -ForegroundColor DarkCyan
     Write-Host ''
+}
+
+# Spawn the detached background session watcher (see Do-Watch).
+function Start-Watcher {
+    try {
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+            '-File', (Join-Path $ScriptDir 'ValheimSync.ps1'), '-Action', 'Watch'
+        ) | Out-Null
+        Write-Ok "Session watcher started - it will offer to UPLOAD when Valheim closes."
+    } catch { Write-Warn2 "(couldn't start the session watcher - $($_.Exception.Message))" }
+}
+
+function Show-WatcherBox([string]$msg, $buttons, $icon) {
+    # DefaultDesktopOnly keeps the box on top even though we run window-less
+    return [System.Windows.Forms.MessageBox]::Show(
+        $msg, 'Valheim Sync', $buttons, $icon,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
+        [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)
+}
+
+# Background session watcher, spawned by EXTRACT. Waits for Valheim to start,
+# refreshes the host-lock heartbeat while it runs (so long sessions don't look
+# abandoned), and offers to UPLOAD the moment the game closes - the easiest
+# step to forget, now hard to miss.
+function Do-Watch {
+    Add-Type -AssemblyName System.Windows.Forms
+    $cfg = Get-Config
+    $me = Get-PlayerName $cfg
+    $world = $cfg.WorldName
+
+    # single instance: a fresh EXTRACT replaces any previous watcher
+    $pidFile = Join-Path $ScriptDir '.watcher.pid'
+    try {
+        if (Test-Path $pidFile) {
+            $old = 0
+            if ([int]::TryParse(((Get-Content $pidFile -ErrorAction SilentlyContinue) | Select-Object -First 1), [ref]$old) -and $old -and $old -ne $PID) {
+                Stop-Process -Id $old -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+    Set-Content $pidFile $PID
+
+    try {
+        # wait up to 2 h for the game to start (they may have extracted and walked away)
+        $deadline = (Get-Date).AddHours(2)
+        while (-not (Get-Process -Name 'valheim', 'valheim_server' -ErrorAction SilentlyContinue)) {
+            if ((Get-Date) -gt $deadline) { return }
+            Start-Sleep -Seconds 20
+        }
+
+        # game is running: bump the lock heartbeat every 15 min
+        $exe = Ensure-Rclone
+        $lastBeat = Get-Date
+        while (Get-Process -Name 'valheim', 'valheim_server' -ErrorAction SilentlyContinue) {
+            Start-Sleep -Seconds 30
+            if (((Get-Date) - $lastBeat).TotalMinutes -lt 15) { continue }
+            $lastBeat = Get-Date
+            try {
+                $m = Get-Manifest $exe $cfg
+                if ($m -and $m.hosting -and $m.hosting.player -eq $me) {
+                    $beat = (Get-Date).ToUniversalTime().ToString('o')
+                    if ($m.hosting.PSObject.Properties.Name -contains 'heartbeatUtc') { $m.hosting.heartbeatUtc = $beat }
+                    else { $m.hosting | Add-Member -NotePropertyName heartbeatUtc -NotePropertyValue $beat }
+                    Set-Manifest $exe $cfg $m
+                }
+            } catch {}
+        }
+
+        # game closed: give the save a moment to flush, then offer to upload
+        Start-Sleep -Seconds 10
+        $m = Get-Manifest $exe $cfg
+        if (-not $m -or -not $m.hosting -or $m.hosting.player -ne $me) { return }  # already uploaded / taken over
+        if ((Get-Config).WorldName -ne $world) { return }                          # user switched worlds meanwhile
+
+        $ans = Show-WatcherBox "Valheim closed and you still hold the host lock for '$world'.`n`nUpload the world to the cloud now so the next person can play?" `
+            ([System.Windows.Forms.MessageBoxButtons]::YesNo) ([System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        try {
+            $script:Force = $true   # the popup was the confirmation
+            Do-Upload
+            Show-WatcherBox "World uploaded - the lock is free for the next host." `
+                ([System.Windows.Forms.MessageBoxButtons]::OK) ([System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        } catch {
+            Show-WatcherBox "Upload failed: $($_.Exception.Message)`n`nOpen Valheim Sync and press UPLOAD manually." `
+                ([System.Windows.Forms.MessageBoxButtons]::OK) ([System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        }
+    } finally {
+        try {
+            if (((Get-Content $pidFile -ErrorAction SilentlyContinue) | Select-Object -First 1) -eq "$PID") {
+                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+    }
 }
 
 function Do-Upload {
@@ -648,6 +748,7 @@ try {
         'History' { Do-History }
         'Restore' { Do-Restore }
         'Worlds'  { Do-Worlds }
+        'Watch'   { Do-Watch }
     }
 } catch {
     Write-Host ''
