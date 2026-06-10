@@ -39,6 +39,18 @@ function Write-Title($m) {
     Write-Host ''
 }
 
+# Append a timestamped line to vsync.log - the only window into the otherwise
+# invisible background watcher. Never throws; self-trims past 512 KB.
+$LogFilePath = Join-Path $ScriptDir 'vsync.log'
+function Write-VsyncLog($msg) {
+    try {
+        if ((Test-Path $LogFilePath) -and (Get-Item $LogFilePath).Length -gt 512KB) {
+            Set-Content $LogFilePath (Get-Content $LogFilePath -Tail 200)
+        }
+        Add-Content $LogFilePath "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
+    } catch {}
+}
+
 function Confirm-Action($message) {
     if ($Force) { return $true }
     $ans = Read-Host "  $message [y/N]"
@@ -440,12 +452,14 @@ function Do-Watch {
     Set-Content $pidFile $PID
 
     try {
+        Write-VsyncLog "watcher: started for '$world' (pid $PID), waiting for Valheim..."
         # wait up to 2 h for the game to start (they may have extracted and walked away)
         $deadline = (Get-Date).AddHours(2)
         while (-not (Get-Process -Name 'valheim', 'valheim_server' -ErrorAction SilentlyContinue)) {
-            if ((Get-Date) -gt $deadline) { return }
+            if ((Get-Date) -gt $deadline) { Write-VsyncLog "watcher: game never started within 2 h - standing down."; return }
             Start-Sleep -Seconds 20
         }
+        Write-VsyncLog "watcher: Valheim is running - heartbeating the lock every 15 min."
 
         # game is running: bump the lock heartbeat every 15 min
         $exe = Ensure-Rclone
@@ -461,25 +475,31 @@ function Do-Watch {
                     if ($m.hosting.PSObject.Properties.Name -contains 'heartbeatUtc') { $m.hosting.heartbeatUtc = $beat }
                     else { $m.hosting | Add-Member -NotePropertyName heartbeatUtc -NotePropertyValue $beat }
                     Set-Manifest $exe $cfg $m
+                    Write-VsyncLog "watcher: lock heartbeat refreshed."
+                } else {
+                    Write-VsyncLog "watcher: lock no longer held by $me - heartbeat skipped."
                 }
-            } catch {}
+            } catch { Write-VsyncLog "watcher: heartbeat failed - $($_.Exception.Message)" }
         }
 
         # game closed: give the save a moment to flush, then offer to upload
+        Write-VsyncLog "watcher: Valheim closed."
         Start-Sleep -Seconds 10
         $m = Get-Manifest $exe $cfg
-        if (-not $m -or -not $m.hosting -or $m.hosting.player -ne $me) { return }  # already uploaded / taken over
-        if ((Get-Config).WorldName -ne $world) { return }                          # user switched worlds meanwhile
+        if (-not $m -or -not $m.hosting -or $m.hosting.player -ne $me) { Write-VsyncLog "watcher: lock already released/taken - standing down."; return }
+        if ((Get-Config).WorldName -ne $world) { Write-VsyncLog "watcher: world switched since extract - standing down."; return }
 
         $ans = Show-WatcherBox "Valheim closed and you still hold the host lock for '$world'.`n`nUpload the world to the cloud now so the next person can play?" `
             ([System.Windows.Forms.MessageBoxButtons]::YesNo) ([System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { Write-VsyncLog "watcher: user declined the upload prompt."; return }
         try {
             $script:Force = $true   # the popup was the confirmation
             Do-Upload
+            Write-VsyncLog "watcher: upload succeeded - lock released."
             Show-WatcherBox "World uploaded - the lock is free for the next host." `
                 ([System.Windows.Forms.MessageBoxButtons]::OK) ([System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
         } catch {
+            Write-VsyncLog "watcher: upload FAILED - $($_.Exception.Message)"
             Show-WatcherBox "Upload failed: $($_.Exception.Message)`n`nOpen Valheim Sync and press UPLOAD manually." `
                 ([System.Windows.Forms.MessageBoxButtons]::OK) ([System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         }
@@ -649,6 +669,16 @@ function Do-Probe {
         $r.me = Get-PlayerName $cfg
         $procs = Get-Process -Name 'valheim', 'valheim_server' -ErrorAction SilentlyContinue
         $r.gameRunning = [bool]$procs
+        $r.watcherActive = $false
+        try {
+            $pidFile = Join-Path $ScriptDir '.watcher.pid'
+            if (Test-Path $pidFile) {
+                $wpid = 0
+                if ([int]::TryParse(((Get-Content $pidFile -ErrorAction SilentlyContinue) | Select-Object -First 1), [ref]$wpid) -and $wpid) {
+                    $r.watcherActive = [bool](Get-Process -Id $wpid -ErrorAction SilentlyContinue)
+                }
+            }
+        } catch {}
         $db = Get-LocalDb $cfg
         $r.localExists = Test-Path $db
         if ($r.localExists) { $r.localDbSize = (Get-Item $db).Length }

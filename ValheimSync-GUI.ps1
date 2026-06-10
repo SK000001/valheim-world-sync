@@ -335,6 +335,9 @@ function Update-Status($p) {
     } elseif ($p.localExists -and $p.cloudNewer) {
         $lines += "  Note  : the cloud copy is NEWER - EXTRACT before you play"
     }
+    if ($p.watcherActive) {
+        $lines += "  Watcher: on duty - you'll be asked to upload when the game closes"
+    }
     $statusBox.Text = ($lines -join "`r`n")
 }
 

@@ -10,6 +10,7 @@ local-backups/
 # Generated at runtime
 valheim-sync.ico
 .watcher.pid
+vsync.log
 
 # The "Share to friends" package (contains your key)
 ValheimSync-for-friends.zip
