@@ -189,7 +189,12 @@ time to see who's hosting right now.
 - **Advanced:** the cloud backend isn't locked to Backblaze. Add a `Remote`
   block to `config.json` (`{ "Root": "myremote:path", "Env": { ... } }`) to point
   at any [rclone](https://rclone.org) backend — Google Drive, OneDrive, S3, etc.
-  — instead of B2. To keep the bucket tidy automatically you can also set a B2
+  — instead of B2. A custom `Remote` uses your own `rclone.conf`, so a **named**
+  remote like `"Root": "gd:valheim"` must already exist there (or be defined via
+  `RCLONE_CONFIG_GD_*` env vars in the `Env` block). Alternatively use rclone's
+  connection-string syntax — `"Root": ":drive:valheim"` with the backend options
+  supplied in `Env` (e.g. `RCLONE_DRIVE_TOKEN`) — which needs no config file.
+  To keep the bucket tidy automatically you can also set a B2
   lifecycle rule to expire old file versions, in place of the built-in per-upload
   cleanup.
 

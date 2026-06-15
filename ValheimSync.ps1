@@ -6,7 +6,7 @@
   UPLOAD it back when you're done. A "lock" in the cloud tracks whose turn
   it is so two people don't host from stale copies and split the world.
 
-  Usage (normally you just double-click the .bat buttons):
+  Usage (normally you just open "Valheim Sync.vbs" and click the buttons):
     powershell -ExecutionPolicy Bypass -File ValheimSync.ps1 -Action Extract
     powershell -ExecutionPolicy Bypass -File ValheimSync.ps1 -Action Upload
     powershell -ExecutionPolicy Bypass -File ValheimSync.ps1 -Action Status
@@ -150,8 +150,11 @@ function Get-RemoteRoot($cfg) {
 
 # Inject the backend credentials into the environment for the next rclone call.
 function Set-RcloneEnv($cfg) {
-    $env:RCLONE_CONFIG = 'NUL'  # ignore any user rclone.conf
     if ($cfg.PSObject.Properties.Name -contains 'Remote' -and $cfg.Remote -and $cfg.Remote.Root) {
+        # Custom backend: do NOT force RCLONE_CONFIG to NUL - a named remote (e.g.
+        # "gd:path") only resolves via the user's rclone.conf or RCLONE_CONFIG_<NAME>_*
+        # env vars. Connection-string roots (":drive:path") work either way. Apply
+        # whatever Env overrides the user supplied.
         if ($cfg.Remote.PSObject.Properties.Name -contains 'Env' -and $cfg.Remote.Env) {
             foreach ($p in $cfg.Remote.Env.PSObject.Properties) {
                 Set-Item -Path "Env:$($p.Name)" -Value ([string]$p.Value)
@@ -159,6 +162,7 @@ function Set-RcloneEnv($cfg) {
         }
         return
     }
+    $env:RCLONE_CONFIG = 'NUL'  # default B2 path: ignore any user rclone.conf
     $env:RCLONE_B2_ACCOUNT = $cfg.B2.KeyId
     $env:RCLONE_B2_KEY = Get-AppKey $cfg
 }
@@ -288,6 +292,45 @@ function Set-Manifest($exe, $cfg, $manifest) {
     $manifest | ConvertTo-Json -Depth 6 | Set-Content $tmp -Encoding UTF8
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $tmp, $remote) | Out-Null
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
+
+# ---------- host-lock heartbeat (separate object, NOT the manifest) ----------
+# The watcher refreshes its liveness into a tiny object of its own rather than
+# rewriting the manifest. Rewriting the whole manifest to bump a heartbeat is a
+# read-modify-write with no compare-and-swap on B2: a concurrent UPLOAD landing
+# in that window would be silently rolled back (manifest's version/sha reverted
+# while latest.zip moved on), which then fails the next EXTRACT's integrity check.
+# Keeping the beat out of the manifest removes that whole class of clobber.
+function Get-RemoteHeartbeat($exe, $cfg) {
+    $remote = Get-Remote $cfg 'heartbeat.json'
+    $tmp = Join-Path $env:TEMP "vsync-hb-$([guid]::NewGuid()).json"
+    $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $remote, $tmp) -AllowFail
+    if ($r.Code -ne 0 -or -not (Test-Path $tmp)) { return $null }
+    $h = $null
+    try { $h = Get-Content $tmp -Raw | ConvertFrom-Json } catch {}
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $h
+}
+
+function Set-RemoteHeartbeat($exe, $cfg, [string]$player, [string]$beat) {
+    $remote = Get-Remote $cfg 'heartbeat.json'
+    $tmp = Join-Path $env:TEMP "vsync-hb-$([guid]::NewGuid()).json"
+    [pscustomobject]@{ player = $player; heartbeatUtc = $beat } | ConvertTo-Json -Depth 4 | Set-Content $tmp -Encoding UTF8
+    Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $tmp, $remote) | Out-Null
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
+
+# Fold the watcher's separately-stored heartbeat into the manifest's hosting block
+# (only when it belongs to the current lock holder) so staleness checks see it.
+# A stale beat from a previous host is ignored because its player won't match.
+function Merge-Heartbeat($exe, $cfg, $m) {
+    if (-not $m -or -not $m.hosting -or -not $m.hosting.player) { return $m }
+    $hb = Get-RemoteHeartbeat $exe $cfg
+    if ($hb -and $hb.player -eq $m.hosting.player -and $hb.heartbeatUtc) {
+        if ($m.hosting.PSObject.Properties.Name -contains 'heartbeatUtc') { $m.hosting.heartbeatUtc = $hb.heartbeatUtc }
+        else { $m.hosting | Add-Member -NotePropertyName heartbeatUtc -NotePropertyValue $hb.heartbeatUtc -Force }
+    }
+    return $m
 }
 
 # ---------- local world-state marker (skew-proof freshness) ----------
@@ -484,6 +527,7 @@ function Do-Extract {
 
     $m = Get-Manifest $exe $cfg
     if (-not $m) { throw "There is no world in the cloud yet. The first host should press UPLOAD instead." }
+    $m = Merge-Heartbeat $exe $cfg $m
 
     # Lock check: is someone else hosting?
     if ($m.hosting -and $m.hosting.player -and $m.hosting.player -ne $me) {
@@ -522,7 +566,9 @@ function Do-Extract {
         Remove-Item $zip -Force -ErrorAction SilentlyContinue
         if (-not $m.sha256) { break }
         $xdb = Get-ChildItem $tmpDir -File | Where-Object { $_.Name -eq "$($cfg.WorldName).db" } | Select-Object -First 1
-        $dbOk = (-not $xdb) -or ((Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -eq $m.sha256)
+        # The manifest claims a sha256, so the .db must be present AND match. A
+        # missing .db (truncated/garbage archive) is a failure, not a pass.
+        $dbOk = $xdb -and ((Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -eq $m.sha256)
         # Verify the .fwl (world seed/metadata) too when the manifest records its hash.
         $fwlOk = $true
         if ($m.PSObject.Properties.Name -contains 'fwlSha256' -and $m.fwlSha256) {
@@ -544,6 +590,14 @@ function Do-Extract {
     $worlds = Get-WorldsPath $cfg
     if (-not (Test-Path $worlds)) { New-Item -ItemType Directory -Path $worlds | Out-Null }
     Write-Step "Installing into $worlds ..."
+    # Clear this world's existing files first - including stale .db.old/.fwl.old
+    # rollback copies from a previous world the new save doesn't carry. Otherwise
+    # Valheim could "recover" the live .db into a foreign/older world. (The
+    # pre-extract backup above already safeguarded the current local copy.)
+    foreach ($leaf in @("$($cfg.WorldName).db", "$($cfg.WorldName).fwl", "$($cfg.WorldName).db.old", "$($cfg.WorldName).fwl.old")) {
+        $stale = Join-Path $worlds $leaf
+        if (Test-Path $stale) { Remove-Item $stale -Force -ErrorAction SilentlyContinue }
+    }
     Copy-Item (Join-Path $tmpDir '*') $worlds -Force
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Ok "World '$($cfg.WorldName)' is ready to play."
@@ -628,7 +682,10 @@ function Do-Watch {
         if (Test-Path $pidFile) {
             $old = 0
             if ([int]::TryParse(((Get-Content $pidFile -ErrorAction SilentlyContinue) | Select-Object -First 1), [ref]$old) -and $old -and $old -ne $PID) {
-                Stop-Process -Id $old -Force -ErrorAction SilentlyContinue
+                # Only kill it if that PID is still a PowerShell process - a recycled
+                # PID could belong to something unrelated.
+                $op = Get-Process -Id $old -ErrorAction SilentlyContinue
+                if ($op -and $op.ProcessName -in @('powershell', 'pwsh')) { Stop-Process -Id $old -Force -ErrorAction SilentlyContinue }
             }
         }
     } catch {}
@@ -652,12 +709,11 @@ function Do-Watch {
             if (((Get-Date) - $lastBeat).TotalMinutes -lt 15) { continue }
             $lastBeat = Get-Date
             try {
+                # Confirm we still hold the lock, then write the beat to its own
+                # object - never rewrite the manifest (see Set-RemoteHeartbeat).
                 $m = Get-Manifest $exe $cfg
                 if ($m -and $m.hosting -and $m.hosting.player -eq $me) {
-                    $beat = (Get-Date).ToUniversalTime().ToString('o')
-                    if ($m.hosting.PSObject.Properties.Name -contains 'heartbeatUtc') { $m.hosting.heartbeatUtc = $beat }
-                    else { $m.hosting | Add-Member -NotePropertyName heartbeatUtc -NotePropertyValue $beat }
-                    Set-Manifest $exe $cfg $m
+                    Set-RemoteHeartbeat $exe $cfg $me ((Get-Date).ToUniversalTime().ToString('o'))
                     Write-VsyncLog "watcher: lock heartbeat refreshed."
                 } else {
                     Write-VsyncLog "watcher: lock no longer held by $me - heartbeat skipped."
@@ -809,8 +865,9 @@ function Do-Setup {
     $keyId = Read-Host "  keyID [$($cfg.B2.KeyId)]"
     if ($keyId) { $cfg.B2.KeyId = $keyId }
     $appKey = Read-Host "  applicationKey (hidden)" -AsSecureString
-    $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($appKey))
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($appKey)
+    try { $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
     if ($plain) {
         # store encrypted at rest; drop any legacy plaintext copy
         if ($cfg.B2.PSObject.Properties.Name -contains 'AppKeyEnc') { $cfg.B2.AppKeyEnc = (Protect-Secret $plain) }
@@ -875,7 +932,8 @@ function Do-Probe {
             if (Test-Path $pidFile) {
                 $wpid = 0
                 if ([int]::TryParse(((Get-Content $pidFile -ErrorAction SilentlyContinue) | Select-Object -First 1), [ref]$wpid) -and $wpid) {
-                    $r.watcherActive = [bool](Get-Process -Id $wpid -ErrorAction SilentlyContinue)
+                    $wp = Get-Process -Id $wpid -ErrorAction SilentlyContinue
+                    $r.watcherActive = [bool]($wp -and $wp.ProcessName -in @('powershell', 'pwsh'))
                 }
             }
         } catch {}
@@ -888,6 +946,7 @@ function Do-Probe {
         $exe = Ensure-Rclone
         $m = Get-Manifest $exe $cfg
         if (-not $m) { $r.cloudEmpty = $true; Emit-Probe $r; return }
+        $m = Merge-Heartbeat $exe $cfg $m
         $r.uploadedBy = $m.uploadedBy
         $r.uploadedAtUtc = $m.uploadedAtUtc
         if ($m.dbSize) { $r.cloudDbSize = $m.dbSize }

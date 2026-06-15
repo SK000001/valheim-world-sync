@@ -947,7 +947,9 @@ if (-not $tray.Icon) { $tray.Icon = [System.Drawing.SystemIcons]::Application }
 $tray.Visible = $false
 
 function Restore-FromTray {
-    $form.Show(); $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+    # The window is shown with ShowDialog() (modal); calling .Show() on it throws
+    # "cannot be displayed modelessly". Just make it visible again instead.
+    $form.Visible = $true; $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
     $form.Activate(); $tray.Visible = $false
 }
 
