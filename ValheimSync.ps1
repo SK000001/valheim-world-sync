@@ -16,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Extract', 'Upload', 'Status', 'Setup', 'Probe', 'History', 'Restore', 'Worlds', 'Watch')]
+    [ValidateSet('Extract', 'Upload', 'Status', 'Setup', 'Probe', 'History', 'Restore', 'Worlds', 'Watch', 'Unlock')]
     [string]$Action = 'Status',
     [string]$Item,
     [switch]$Force
@@ -58,13 +58,20 @@ function Confirm-Action($message) {
 }
 
 # ---------- config ----------
+# True if config.json carries usable backend credentials (B2 by default, or a
+# custom rclone Remote block for advanced users).
+function Test-Configured($cfg) {
+    if ($cfg.PSObject.Properties.Name -contains 'Remote' -and $cfg.Remote -and $cfg.Remote.Root) { return $true }
+    return [bool]($cfg.B2 -and $cfg.B2.Bucket -and $cfg.B2.KeyId -and $cfg.B2.KeyId -ne 'PASTE_KEY_ID_HERE')
+}
+
 function Get-Config {
     if (-not (Test-Path $ConfigPath)) {
         throw "No config.json found. Run the Setup button first."
     }
     $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-    if (-not $cfg.B2.KeyId -or $cfg.B2.KeyId -eq 'PASTE_KEY_ID_HERE') {
-        throw "config.json has no B2 credentials yet. Run the Setup button first."
+    if (-not (Test-Configured $cfg)) {
+        throw "config.json has no backend credentials yet. Run the Setup button first."
     }
     return $cfg
 }
@@ -88,6 +95,74 @@ function Get-HistoryKeep($cfg) {
     return 20
 }
 
+function Get-AutoUploadOnClose($cfg) {
+    if ($cfg.PSObject.Properties.Name -contains 'AutoUploadOnClose') { return [bool]$cfg.AutoUploadOnClose }
+    return $false
+}
+
+# ---------- secret at rest (DPAPI) ----------
+# The B2 application key is stored encrypted with the Windows DPAPI (CurrentUser)
+# in config.json's B2.AppKeyEnc, so a casual reader of the folder can't lift it.
+# Plaintext B2.AppKey is still honoured (legacy configs and the friends zip, which
+# necessarily ships a usable key). Encryption is per-user/per-machine, so the
+# share packager re-writes a plaintext key for friends - see Package.ps1.
+function Protect-Secret([string]$plain) {
+    if (-not $plain) { return '' }
+    try {
+        Add-Type -AssemblyName System.Security
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
+        $enc = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, 'CurrentUser')
+        return [Convert]::ToBase64String($enc)
+    } catch { return '' }
+}
+
+function Unprotect-Secret([string]$enc) {
+    if (-not $enc) { return '' }
+    try {
+        Add-Type -AssemblyName System.Security
+        $bytes = [Convert]::FromBase64String($enc)
+        $dec = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, 'CurrentUser')
+        return [System.Text.Encoding]::UTF8.GetString($dec)
+    } catch { return '' }
+}
+
+# The usable plaintext B2 key, from whichever form config.json carries.
+function Get-AppKey($cfg) {
+    if ($cfg.B2.PSObject.Properties.Name -contains 'AppKeyEnc' -and $cfg.B2.AppKeyEnc) {
+        $k = Unprotect-Secret $cfg.B2.AppKeyEnc
+        if ($k) { return $k }
+    }
+    if ($cfg.B2.PSObject.Properties.Name -contains 'AppKey') { return $cfg.B2.AppKey }
+    return ''
+}
+
+# ---------- cloud backend (rclone remote) ----------
+# Default backend is Backblaze B2 with creds injected via env (no rclone.conf).
+# Advanced users can point at any rclone remote by adding a "Remote" block to
+# config.json, e.g. { "Type":"drive", "Root":"mygdrive:valheim-sync",
+# "Env": { "RCLONE_DRIVE_..." : "..." } } - in which case Root replaces :b2:bucket.
+function Get-RemoteRoot($cfg) {
+    if ($cfg.PSObject.Properties.Name -contains 'Remote' -and $cfg.Remote -and $cfg.Remote.Root) {
+        return ([string]$cfg.Remote.Root).TrimEnd('/')
+    }
+    ":b2:$($cfg.B2.Bucket)"
+}
+
+# Inject the backend credentials into the environment for the next rclone call.
+function Set-RcloneEnv($cfg) {
+    $env:RCLONE_CONFIG = 'NUL'  # ignore any user rclone.conf
+    if ($cfg.PSObject.Properties.Name -contains 'Remote' -and $cfg.Remote -and $cfg.Remote.Root) {
+        if ($cfg.Remote.PSObject.Properties.Name -contains 'Env' -and $cfg.Remote.Env) {
+            foreach ($p in $cfg.Remote.Env.PSObject.Properties) {
+                Set-Item -Path "Env:$($p.Name)" -Value ([string]$p.Value)
+            }
+        }
+        return
+    }
+    $env:RCLONE_B2_ACCOUNT = $cfg.B2.KeyId
+    $env:RCLONE_B2_KEY = Get-AppKey $cfg
+}
+
 # True if a held lock is older than the stale threshold (likely an abandoned session).
 # The session watcher refreshes hosting.heartbeatUtc while the game runs, so a
 # genuine marathon session is judged by its last heartbeat, not its start time.
@@ -101,15 +176,39 @@ function Test-LockStale($m, $cfg) {
     } catch { return $false }
 }
 
-# Post a message to the group's Discord webhook, if one is configured. Never throws.
-function Send-Discord($cfg, $message) {
+# Strip Discord :emoji: shortcodes for plain-text channels like ntfy.
+function Remove-Shortcodes([string]$s) { ($s -replace ':[a-z0-9_]+:\s*', '').Trim() }
+
+# Notify the group across whatever channels are configured (all optional, none
+# ever throws): a Discord webhook (as a coloured embed, with an optional role
+# @mention) and/or an ntfy topic URL for non-Discord groups.
+#   $color : Discord embed colour - 'red' (in use), 'green' (free), 'orange' (rollback)
+function Send-Notify($cfg, [string]$message, [string]$color = 'green') {
+    $palette = @{ red = 15158332; green = 3066993; blue = 3447003; orange = 15105570 }
+    $intColor = $palette[$color]; if (-not $intColor) { $intColor = $palette['green'] }
+
     $hook = $null
     if ($cfg.PSObject.Properties.Name -contains 'DiscordWebhook') { $hook = $cfg.DiscordWebhook }
-    if (-not $hook) { return }
-    try {
-        $body = @{ content = $message } | ConvertTo-Json
-        Invoke-RestMethod -Method Post -Uri $hook -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
-    } catch { Write-Warn2 "(Discord notification failed - $($_.Exception.Message))" }
+    if ($hook) {
+        try {
+            $payload = @{ embeds = @(@{ description = $message; color = $intColor }) }
+            if ($cfg.PSObject.Properties.Name -contains 'DiscordRoleId' -and $cfg.DiscordRoleId) {
+                $payload.content = "<@&$($cfg.DiscordRoleId)>"
+                $payload.allowed_mentions = @{ roles = @([string]$cfg.DiscordRoleId) }
+            }
+            $body = $payload | ConvertTo-Json -Depth 6
+            Invoke-RestMethod -Method Post -Uri $hook -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+        } catch { Write-Warn2 "(Discord notification failed - $($_.Exception.Message))" }
+    }
+
+    $ntfy = $null
+    if ($cfg.PSObject.Properties.Name -contains 'NtfyUrl' -and $cfg.NtfyUrl) { $ntfy = $cfg.NtfyUrl }
+    if ($ntfy) {
+        try {
+            Invoke-RestMethod -Method Post -Uri $ntfy -Body (Remove-Shortcodes $message) `
+                -Headers @{ Title = 'Valheim Sync' } -TimeoutSec 10 | Out-Null
+        } catch { Write-Warn2 "(ntfy notification failed - $($_.Exception.Message))" }
+    }
 }
 
 # ---------- rclone ----------
@@ -150,9 +249,7 @@ function Ensure-Rclone {
 # automatic $args variable and makes @-splatting expand to nothing.
 function Invoke-Rclone {
     param([string]$Exe, $Cfg, [string[]]$RcArgs, [switch]$AllowFail)
-    $env:RCLONE_B2_ACCOUNT = $Cfg.B2.KeyId
-    $env:RCLONE_B2_KEY = $Cfg.B2.AppKey
-    $env:RCLONE_CONFIG = 'NUL'  # ignore any user rclone.conf
+    Set-RcloneEnv $Cfg
     # rclone writes progress/info to stderr; under EAP=Stop a 2>&1 capture would
     # turn that into a terminating error, so relax it just for the native call.
     $prev = $ErrorActionPreference
@@ -171,7 +268,7 @@ function Invoke-Rclone {
 
 function Get-Remote($cfg, $leaf) {
     # e.g.  :b2:my-bucket/valheim/sivandarvin/latest.zip
-    ":b2:$($cfg.B2.Bucket)/valheim/$($cfg.WorldName)/$leaf"
+    "$(Get-RemoteRoot $cfg)/valheim/$($cfg.WorldName)/$leaf"
 }
 
 # ---------- manifest (latest-save metadata + host lock, one JSON in the cloud) ----------
@@ -193,11 +290,74 @@ function Set-Manifest($exe, $cfg, $manifest) {
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
 }
 
+# ---------- local world-state marker (skew-proof freshness) ----------
+# Comparing a local file's mtime against the cloud's uploadedAtUtc means comparing
+# two clocks on two machines - drift > 2 min gives false "newer/older" verdicts.
+# Instead we record, per world, the manifest "version" we last synced to and the
+# local .db mtime at that moment. Both later comparisons are same-machine:
+#   cloudNewer  = manifest.version > the version we last synced
+#   localNewer  = our .db changed since we synced AND the cloud hasn't moved on
+# The old timestamp heuristic stays as a fallback for pre-version manifests.
+$WorldStatePath = Join-Path $ScriptDir '.worldstate.json'
+
+function Get-WorldState($cfg) {
+    if (-not (Test-Path $WorldStatePath)) { return $null }
+    try {
+        $all = Get-Content $WorldStatePath -Raw | ConvertFrom-Json
+        $name = $cfg.WorldName
+        if ($all.PSObject.Properties.Name -contains $name) { return $all.$name }
+    } catch {}
+    return $null
+}
+
+function Set-WorldState($cfg, [int]$version, [string]$mtimeUtc, [string]$sha) {
+    $all = $null
+    if (Test-Path $WorldStatePath) { try { $all = Get-Content $WorldStatePath -Raw | ConvertFrom-Json } catch {} }
+    if (-not $all) { $all = [pscustomobject]@{} }
+    $entry = [pscustomobject]@{ version = $version; syncedMtimeUtc = $mtimeUtc; sha256 = $sha }
+    if ($all.PSObject.Properties.Name -contains $cfg.WorldName) { $all.$($cfg.WorldName) = $entry }
+    else { $all | Add-Member -NotePropertyName $cfg.WorldName -NotePropertyValue $entry -Force }
+    try { $all | ConvertTo-Json -Depth 6 | Set-Content $WorldStatePath -Encoding UTF8 } catch {}
+}
+
+# Decide whether the local copy or the cloud copy is the newer one. Returns
+# @{ localNewer; cloudNewer }. Prefers the version counter; falls back to mtimes.
+function Get-Freshness($cfg, $m, $dbPath) {
+    $res = @{ localNewer = $false; cloudNewer = $false }
+    if (-not $m) { return $res }
+    $localExists = ($dbPath -and (Test-Path $dbPath))
+    $cloudVer = 0
+    if ($m.PSObject.Properties.Name -contains 'version' -and $m.version) { try { $cloudVer = [int]$m.version } catch {} }
+    $state = Get-WorldState $cfg
+    if ($cloudVer -gt 0 -and $state -and ($state.PSObject.Properties.Name -contains 'version')) {
+        $myVer = 0; try { $myVer = [int]$state.version } catch {}
+        $res.cloudNewer = ($cloudVer -gt $myVer)
+        if (-not $res.cloudNewer -and $localExists -and $state.syncedMtimeUtc) {
+            try {
+                $synced = [datetime]::Parse($state.syncedMtimeUtc).ToUniversalTime()
+                $now = (Get-Item $dbPath).LastWriteTimeUtc
+                $res.localNewer = ($now -gt $synced.AddSeconds(5))
+            } catch {}
+        }
+        return $res
+    }
+    # fallback: cross-machine timestamp heuristic (pre-version manifests)
+    if ($localExists -and $m.uploadedAtUtc) {
+        try {
+            $local = (Get-Item $dbPath).LastWriteTimeUtc
+            $cloud = [datetime]::Parse($m.uploadedAtUtc).ToUniversalTime()
+            $res.localNewer = ($local -gt $cloud.AddMinutes(2))
+            $res.cloudNewer = ($cloud -gt $local.AddMinutes(2))
+        } catch {}
+    }
+    return $res
+}
+
 # Keep the bucket lean: drop old hidden file versions, and trim history/ to the
 # newest HistoryKeep saves. Best-effort - never blocks an upload.
 function Invoke-StorageCleanup($exe, $cfg) {
     try {
-        $worldRemote = ":b2:$($cfg.B2.Bucket)/valheim/$($cfg.WorldName)"
+        $worldRemote = "$(Get-RemoteRoot $cfg)/valheim/$($cfg.WorldName)"
         # purge superseded versions of the repeatedly-overwritten files (latest.zip, manifest.json)
         Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('cleanup', $worldRemote) -AllowFail | Out-Null
         # trim history to the newest N
@@ -303,11 +463,11 @@ function Do-Status {
     if (Test-Path $db) {
         $local = (Get-Item $db).LastWriteTimeUtc
         Write-Host "  Your local copy: $($cfg.WorldName).db, modified $(Format-Age $local.ToString('o'))" -ForegroundColor Gray
-        if ($m -and $m.uploadedAtUtc) {
-            $cloud = [datetime]::Parse($m.uploadedAtUtc).ToUniversalTime()
-            if ($local -gt $cloud.AddMinutes(2)) {
-                Write-Warn2 "Your local copy is NEWER than the cloud. If you just hosted, press UPLOAD."
-            }
+        $fresh = Get-Freshness $cfg $m $db
+        if ($fresh.localNewer) {
+            Write-Warn2 "Your local copy is NEWER than the cloud. If you just hosted, press UPLOAD."
+        } elseif ($fresh.cloudNewer) {
+            Write-Warn2 "The cloud copy is NEWER than yours. Press EXTRACT before you play."
         }
     } else {
         Write-Host "  Your local copy: none yet - press EXTRACT to download the world." -ForegroundColor Gray
@@ -339,9 +499,7 @@ function Do-Extract {
     # Freshness check: would we clobber newer local progress?
     $db = Get-LocalDb $cfg
     if (Test-Path $db) {
-        $local = (Get-Item $db).LastWriteTimeUtc
-        $cloud = [datetime]::Parse($m.uploadedAtUtc).ToUniversalTime()
-        if ($local -gt $cloud.AddMinutes(2)) {
+        if ((Get-Freshness $cfg $m $db).localNewer) {
             Write-Warn2 "Your local copy is NEWER than the cloud version."
             Write-Warn2 "Extracting will overwrite your local world with the (older) cloud one."
             if (-not (Confirm-Action "Overwrite local with the cloud copy?")) { throw "Aborted - run UPLOAD if your local copy is the good one." }
@@ -364,7 +522,14 @@ function Do-Extract {
         Remove-Item $zip -Force -ErrorAction SilentlyContinue
         if (-not $m.sha256) { break }
         $xdb = Get-ChildItem $tmpDir -File | Where-Object { $_.Name -eq "$($cfg.WorldName).db" } | Select-Object -First 1
-        if (-not $xdb -or (Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -eq $m.sha256) {
+        $dbOk = (-not $xdb) -or ((Get-FileHash $xdb.FullName -Algorithm SHA256).Hash -eq $m.sha256)
+        # Verify the .fwl (world seed/metadata) too when the manifest records its hash.
+        $fwlOk = $true
+        if ($m.PSObject.Properties.Name -contains 'fwlSha256' -and $m.fwlSha256) {
+            $xfwl = Get-ChildItem $tmpDir -File | Where-Object { $_.Name -eq "$($cfg.WorldName).fwl" } | Select-Object -First 1
+            $fwlOk = $xfwl -and ((Get-FileHash $xfwl.FullName -Algorithm SHA256).Hash -eq $m.fwlSha256)
+        }
+        if ($dbOk -and $fwlOk) {
             if ($xdb) { Write-Ok "Download verified (SHA256 matches the manifest)." }
             break
         }
@@ -397,12 +562,30 @@ function Do-Extract {
         $m = $m2
     }
 
-    # Claim the lock - it's your turn to host.
+    # Record what we just synced to, for skew-proof freshness checks later.
+    $localDb = Get-LocalDb $cfg
+    if (Test-Path $localDb) {
+        $cloudVer = 0; if ($m.PSObject.Properties.Name -contains 'version' -and $m.version) { try { $cloudVer = [int]$m.version } catch {} }
+        Set-WorldState $cfg $cloudVer ((Get-Item $localDb).LastWriteTimeUtc.ToString('o')) $m.sha256
+    }
+
+    # Claim the lock - it's your turn to host. Stamp a unique nonce so we can
+    # confirm OUR write won: B2/rclone is last-write-wins with no compare-and-swap,
+    # so two near-simultaneous claims can race past the re-read above. After
+    # writing we read back; if our nonce isn't there, someone overwrote us.
+    $nonce = [guid]::NewGuid().ToString('N')
     if (-not $m.hosting) { $m | Add-Member -NotePropertyName hosting -NotePropertyValue $null -Force }
-    $m.hosting = [pscustomobject]@{ player = $me; sinceUtc = (Get-Date).ToUniversalTime().ToString('o') }
+    $m.hosting = [pscustomobject]@{ player = $me; sinceUtc = (Get-Date).ToUniversalTime().ToString('o'); nonce = $nonce }
     Set-Manifest $exe $cfg $m
+    Start-Sleep -Milliseconds 1500
+    $confirm = Get-Manifest $exe $cfg
+    if ($confirm -and $confirm.hosting -and ($confirm.hosting.PSObject.Properties.Name -contains 'nonce') -and
+        $confirm.hosting.nonce -ne $nonce -and $confirm.hosting.player -ne $me) {
+        throw "$($confirm.hosting.player) claimed the host lock at the same moment. Coordinate who hosts, then press EXTRACT again. Your local world is downloaded and ready."
+    }
+    if ($confirm) { $m = $confirm }
     Write-Ok "Lock claimed - you're marked as the host."
-    Send-Discord $cfg ":red_circle: **$me** is now hosting **$($cfg.WorldName)** - world is in use (picking up $($m.uploadedBy)'s save from $(Format-Age $m.uploadedAtUtc))."
+    Send-Notify $cfg ":red_circle: **$me** is now hosting **$($cfg.WorldName)** - world is in use (picking up $($m.uploadedBy)'s save from $(Format-Age $m.uploadedAtUtc))." 'red'
     Start-Watcher
     Write-Host ''
     Write-Host "  >> Host the world in-game now. When you're done, press UPLOAD. <<" -ForegroundColor Cyan
@@ -489,9 +672,15 @@ function Do-Watch {
         if (-not $m -or -not $m.hosting -or $m.hosting.player -ne $me) { Write-VsyncLog "watcher: lock already released/taken - standing down."; return }
         if ((Get-Config).WorldName -ne $world) { Write-VsyncLog "watcher: world switched since extract - standing down."; return }
 
-        $ans = Show-WatcherBox "Valheim closed and you still hold the host lock for '$world'.`n`nUpload the world to the cloud now so the next person can play?" `
-            ([System.Windows.Forms.MessageBoxButtons]::YesNo) ([System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { Write-VsyncLog "watcher: user declined the upload prompt."; return }
+        # With AutoUploadOnClose set, skip the prompt and just upload (the user
+        # has opted in to always uploading when they close the game).
+        if (Get-AutoUploadOnClose $cfg) {
+            Write-VsyncLog "watcher: AutoUploadOnClose is on - uploading without prompting."
+        } else {
+            $ans = Show-WatcherBox "Valheim closed and you still hold the host lock for '$world'.`n`nUpload the world to the cloud now so the next person can play?" `
+                ([System.Windows.Forms.MessageBoxButtons]::YesNo) ([System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { Write-VsyncLog "watcher: user declined the upload prompt."; return }
+        }
         try {
             $script:Force = $true   # the popup was the confirmation
             Do-Upload
@@ -530,15 +719,11 @@ function Do-Upload {
 
     # Guard: the cloud already has a NEWER world than your local copy. Uploading
     # now would overwrite whoever saved it last (you forgot to EXTRACT first).
-    if ($m -and $m.uploadedAtUtc) {
-        $localMtime = (Get-Item $db).LastWriteTimeUtc
-        $cloud = [datetime]::Parse($m.uploadedAtUtc).ToUniversalTime()
-        if ($cloud -gt $localMtime.AddMinutes(2)) {
-            Write-Warn2 "The cloud world (saved by $($m.uploadedBy)) is NEWER than your local copy."
-            Write-Warn2 "Uploading now would overwrite their progress. Did you forget to EXTRACT first?"
-            if (-not (Confirm-Action "Upload anyway and overwrite the newer cloud world?")) {
-                throw "Aborted - run EXTRACT to get the latest world before playing."
-            }
+    if ($m -and (Get-Freshness $cfg $m $db).cloudNewer) {
+        Write-Warn2 "The cloud world (saved by $($m.uploadedBy)) is NEWER than your local copy."
+        Write-Warn2 "Uploading now would overwrite their progress. Did you forget to EXTRACT first?"
+        if (-not (Confirm-Action "Upload anyway and overwrite the newer cloud world?")) {
+            throw "Aborted - run EXTRACT to get the latest world before playing."
         }
     }
 
@@ -563,8 +748,9 @@ function Do-Upload {
     $zip = Join-Path $env:TEMP "vsync-upload-$([guid]::NewGuid()).zip"
     Compress-Archive -Path (Get-WorldFiles $db $fwl) -DestinationPath $zip -Force
     $hash = (Get-FileHash $db -Algorithm SHA256).Hash
+    $fwlHash = (Get-FileHash $fwl -Algorithm SHA256).Hash
 
-    Write-Step "Uploading to B2..."
+    Write-Step "Uploading to the cloud..."
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $zip, (Get-Remote $cfg 'latest.zip'), '--progress') | Out-Null
 
     # Versioned history copy (so a bad save can be rolled back from the B2 web UI)
@@ -573,22 +759,31 @@ function Do-Upload {
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $zip, (Get-Remote $cfg $histLeaf)) | Out-Null
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
 
+    # Monotonic version counter: increments on every publish, the skew-proof basis
+    # for "is the cloud newer than me?" (see Get-Freshness).
+    $newVer = 1
+    if ($m -and $m.PSObject.Properties.Name -contains 'version' -and $m.version) { try { $newVer = [int]$m.version + 1 } catch {} }
+
     # New manifest, lock released.
     $manifest = [pscustomobject]@{
         world        = $cfg.WorldName
+        version      = $newVer
         uploadedBy   = $me
         uploadedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
         dbSize       = (Get-Item $db).Length
         sha256       = $hash
+        fwlSha256    = $fwlHash
         hosting      = $null
     }
     Set-Manifest $exe $cfg $manifest
+    # We are now in sync with the version we just published.
+    Set-WorldState $cfg $newVer ((Get-Item $db).LastWriteTimeUtc.ToString('o')) $hash
     Write-Ok "World uploaded. Lock released - anyone can EXTRACT and host next."
     $details = @('world is {0:N1} MB' -f ((Get-Item $db).Length / 1MB))
     if ($m -and $m.hosting -and $m.hosting.player -eq $me -and $m.hosting.sinceUtc) {
         try { $details = @("played $(Format-Span ((Get-Date).ToUniversalTime() - [datetime]::Parse($m.hosting.sinceUtc).ToUniversalTime()))") + $details } catch {}
     }
-    Send-Discord $cfg ":green_circle: **$me** finished playing **$($cfg.WorldName)** - world is free to host ($($details -join ', '))."
+    Send-Notify $cfg ":green_circle: **$me** finished playing **$($cfg.WorldName)** - world is free to host ($($details -join ', '))." 'green'
     Invoke-StorageCleanup $exe $cfg
     Write-Host ''
 }
@@ -616,7 +811,12 @@ function Do-Setup {
     $appKey = Read-Host "  applicationKey (hidden)" -AsSecureString
     $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($appKey))
-    if ($plain) { $cfg.B2.AppKey = $plain }
+    if ($plain) {
+        # store encrypted at rest; drop any legacy plaintext copy
+        if ($cfg.B2.PSObject.Properties.Name -contains 'AppKeyEnc') { $cfg.B2.AppKeyEnc = (Protect-Secret $plain) }
+        else { $cfg.B2 | Add-Member -NotePropertyName AppKeyEnc -NotePropertyValue (Protect-Secret $plain) -Force }
+        if ($cfg.B2.PSObject.Properties.Name -contains 'AppKey') { $cfg.B2.AppKey = '' }
+    }
     $detected = @()
     try {
         $wl = Get-WorldsPath $cfg
@@ -642,7 +842,7 @@ function Do-Setup {
 
     Write-Step "Testing connection to B2..."
     $exe = Ensure-Rclone
-    $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsd', ":b2:$($cfg.B2.Bucket)") -AllowFail
+    $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsd', (Get-RemoteRoot $cfg)) -AllowFail
     if ($r.Code -eq 0) {
         Write-Ok "Connected to bucket '$($cfg.B2.Bucket)' successfully."
         Write-Host ''
@@ -682,7 +882,7 @@ function Do-Probe {
         $db = Get-LocalDb $cfg
         $r.localExists = Test-Path $db
         if ($r.localExists) { $r.localDbSize = (Get-Item $db).Length }
-        $hasCreds = $cfg.B2.KeyId -and $cfg.B2.KeyId -ne 'PASTE_KEY_ID_HERE' -and $cfg.B2.Bucket
+        $hasCreds = Test-Configured $cfg
         $r.configured = [bool]$hasCreds
         if (-not $hasCreds) { Emit-Probe $r; return }
         $exe = Ensure-Rclone
@@ -696,11 +896,10 @@ function Do-Probe {
             $r.hostingSinceUtc = $m.hosting.sinceUtc
             $r.lockStale = Test-LockStale $m $cfg
         }
-        if ($r.localExists -and $m.uploadedAtUtc) {
-            $local = (Get-Item $db).LastWriteTimeUtc
-            $cloud = [datetime]::Parse($m.uploadedAtUtc).ToUniversalTime()
-            $r.localNewer = ($local -gt $cloud.AddMinutes(2))
-            $r.cloudNewer = ($cloud -gt $local.AddMinutes(2))
+        if ($r.localExists) {
+            $fresh = Get-Freshness $cfg $m $db
+            $r.localNewer = $fresh.localNewer
+            $r.cloudNewer = $fresh.cloudNewer
         }
     } catch {
         $r.error = $_.Exception.Message
@@ -714,7 +913,7 @@ function Do-History {
     try {
         $cfg = Get-Config
         $exe = Ensure-Rclone
-        $remote = ":b2:$($cfg.B2.Bucket)/valheim/$($cfg.WorldName)/history/"
+        $remote = "$(Get-RemoteRoot $cfg)/valheim/$($cfg.WorldName)/history/"
         $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsf', $remote) -AllowFail
         if ($r.Code -eq 0 -and $r.Output) {
             foreach ($name in ($r.Output -split "`r?`n")) {
@@ -739,7 +938,7 @@ function Do-Restore {
     $exe = Ensure-Rclone
     Write-Title "RESTORE - roll the world back to an earlier save"
     if (-not $Item) { throw "No history file given (-Item)." }
-    $base = ":b2:$($cfg.B2.Bucket)/valheim/$($cfg.WorldName)"
+    $base = "$(Get-RemoteRoot $cfg)/valheim/$($cfg.WorldName)"
 
     $player = 'unknown'
     if ($Item -match '^\d{8}-\d{6}_(.+)\.zip$') { $player = $Matches[1] }
@@ -749,29 +948,62 @@ function Do-Restore {
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', "$base/history/$Item", $zip, '--progress') | Out-Null
     if (-not (Test-Path $zip)) { throw "Could not download '$Item' from history." }
 
-    # read db for accurate manifest fields
+    # read db/fwl for accurate manifest fields
     $dir = Join-Path $env:TEMP "vsync-restore-$([guid]::NewGuid())"
     Expand-Archive -Path $zip -DestinationPath $dir -Force
     $rdb = Get-ChildItem $dir -Filter '*.db' | Select-Object -First 1
+    $rfwl = Get-ChildItem $dir -Filter '*.fwl' | Select-Object -First 1
+
+    # bump the version past the current cloud one so others see "cloud is newer"
+    $prev = Get-Manifest $exe $cfg
+    $newVer = 1
+    if ($prev -and $prev.PSObject.Properties.Name -contains 'version' -and $prev.version) { try { $newVer = [int]$prev.version + 1 } catch {} }
 
     Write-Step "Publishing it as the current world..."
     Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('copyto', $zip, "$base/latest.zip", '--progress') | Out-Null
 
     $manifest = [pscustomobject]@{
         world         = $cfg.WorldName
+        version       = $newVer
         uploadedBy    = "$player (restored)"
         uploadedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
         dbSize        = $(if ($rdb) { $rdb.Length } else { 0 })
         sha256        = $(if ($rdb) { (Get-FileHash $rdb.FullName -Algorithm SHA256).Hash } else { '' })
+        fwlSha256     = $(if ($rfwl) { (Get-FileHash $rfwl.FullName -Algorithm SHA256).Hash } else { '' })
         hosting       = $null
     }
     Set-Manifest $exe $cfg $manifest
     Remove-Item $zip, $dir -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Ok "Restored $player's save as the current world. Lock is free."
-    Send-Discord $cfg ":rewind: World **$($cfg.WorldName)** was rolled back to **$player**'s earlier save."
+    Send-Notify $cfg ":rewind: World **$($cfg.WorldName)** was rolled back to **$player**'s earlier save." 'orange'
     Write-Host ''
     Write-Host "  >> Press EXTRACT to download the restored world. <<" -ForegroundColor Cyan
+    Write-Host ''
+}
+
+# Manually release the host lock without uploading - for when a session is stuck
+# (someone forgot to upload, or a watcher died) and the group wants the world freed.
+function Do-Unlock {
+    $cfg = Get-Config
+    $exe = Ensure-Rclone
+    $me = Get-PlayerName $cfg
+    Write-Title "RELEASE LOCK - free the world for the next host"
+    $m = Get-Manifest $exe $cfg
+    if (-not $m) { throw "There is no world in the cloud yet - nothing to unlock." }
+    if (-not $m.hosting -or -not $m.hosting.player) {
+        Write-Ok "The lock is already free - nobody is marked as hosting."
+        return
+    }
+    $holder = $m.hosting.player
+    if ($holder -ne $me -and -not $Force) {
+        Write-Warn2 "$holder holds the lock, not you."
+        if (-not (Confirm-Action "Release $holder's lock anyway?")) { throw "Aborted." }
+    }
+    $m.hosting = $null
+    Set-Manifest $exe $cfg $m
+    Write-Ok "Lock released - anyone can EXTRACT and host next."
+    Send-Notify $cfg ":unlock: **$me** released the host lock on **$($cfg.WorldName)** - world is free to host." 'green'
     Write-Host ''
 }
 
@@ -785,14 +1017,14 @@ function Do-Worlds {
         $cfg = Get-Config
         $current = $cfg.WorldName
         $exe = Ensure-Rclone
-        $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsf', '--dirs-only', ":b2:$($cfg.B2.Bucket)/valheim/") -AllowFail
+        $r = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('lsf', '--dirs-only', "$(Get-RemoteRoot $cfg)/valheim/") -AllowFail
         if ($r.Code -eq 0 -and $r.Output) {
             foreach ($d in ($r.Output -split "`r?`n")) {
                 $name = $d.Trim().TrimEnd('/')
                 if ($name) { $worlds += $name }
             }
         }
-        $sz = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('size', ":b2:$($cfg.B2.Bucket)", '--json') -AllowFail
+        $sz = Invoke-Rclone -Exe $exe -Cfg $cfg -RcArgs @('size', (Get-RemoteRoot $cfg), '--json') -AllowFail
         if ($sz.Code -eq 0 -and $sz.Output -match '\{.+\}') {
             try { $bucketBytes = [long]((($Matches[0]) | ConvertFrom-Json).bytes) } catch {}
         }
@@ -801,24 +1033,30 @@ function Do-Worlds {
 }
 
 # ============================================================
-try {
-    switch ($Action) {
-        'Status'  { Do-Status }
-        'Extract' { Do-Extract }
-        'Upload'  { Do-Upload }
-        'Setup'   { Do-Setup }
-        'Probe'   { Do-Probe }
-        'History' { Do-History }
-        'Restore' { Do-Restore }
-        'Worlds'  { Do-Worlds }
-        'Watch'   { Do-Watch }
+# When dot-sourced (e.g. by the Pester tests or Package.ps1 to reuse helpers),
+# $MyInvocation.InvocationName is '.' - skip the action dispatch and just expose
+# the functions. A normal -File launch runs the requested action.
+if ($MyInvocation.InvocationName -ne '.') {
+    try {
+        switch ($Action) {
+            'Status'  { Do-Status }
+            'Extract' { Do-Extract }
+            'Upload'  { Do-Upload }
+            'Setup'   { Do-Setup }
+            'Probe'   { Do-Probe }
+            'History' { Do-History }
+            'Restore' { Do-Restore }
+            'Worlds'  { Do-Worlds }
+            'Watch'   { Do-Watch }
+            'Unlock'  { Do-Unlock }
+        }
+    } catch {
+        Write-Host ''
+        Write-ErrLine $_.Exception.Message
+        if ($_.InvocationInfo) {
+            Write-Host "      at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+        }
+        Write-Host ''
+        exit 1
     }
-} catch {
-    Write-Host ''
-    Write-ErrLine $_.Exception.Message
-    if ($_.InvocationInfo) {
-        Write-Host "      at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
-    }
-    Write-Host ''
-    exit 1
 }
