@@ -121,18 +121,29 @@ $form.Size = New-Object System.Drawing.Size(560, 600)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
-$form.BackColor = [System.Drawing.Color]::FromArgb(30, 32, 38)
+$form.BackColor = [System.Drawing.Color]::FromArgb(26, 28, 34)
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 Ensure-Icon
 if (Test-Path $IconPath) { try { $form.Icon = New-Object System.Drawing.Icon($IconPath) } catch {} }
 
+# shared accent colour (Valheim green) used for the header rule and status bar
+$cAccent = [System.Drawing.Color]::FromArgb(102, 187, 106)
+
 $title = New-Object System.Windows.Forms.Label
 $title.Text = 'Valheim Sync'
 $title.ForeColor = [System.Drawing.Color]::White
-$title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
-$title.Location = New-Object System.Drawing.Point(20, 14)
-$title.Size = New-Object System.Drawing.Size(250, 30)
+$title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 16, [System.Drawing.FontStyle]::Bold)
+$title.Location = New-Object System.Drawing.Point(20, 12)
+$title.Size = New-Object System.Drawing.Size(250, 28)
 $form.Controls.Add($title)
+
+$subtitle = New-Object System.Windows.Forms.Label
+$subtitle.Text = 'one shared world - no host needs to stay online'
+$subtitle.ForeColor = [System.Drawing.Color]::FromArgb(130, 134, 144)
+$subtitle.Font = New-Object System.Drawing.Font('Segoe UI', 8.25)
+$subtitle.Location = New-Object System.Drawing.Point(22, 40)
+$subtitle.Size = New-Object System.Drawing.Size(300, 16)
+$form.Controls.Add($subtitle)
 
 # world selector (top-right)
 $worldLabel = New-Object System.Windows.Forms.Label
@@ -151,10 +162,23 @@ $worldCombo.BackColor = [System.Drawing.Color]::FromArgb(22, 24, 28)
 $worldCombo.ForeColor = [System.Drawing.Color]::Gainsboro
 $form.Controls.Add($worldCombo)
 
-# status panel
+# thin accent rule under the header
+$headerRule = New-Object System.Windows.Forms.Panel
+$headerRule.Location = New-Object System.Drawing.Point(20, 58)
+$headerRule.Size = New-Object System.Drawing.Size(508, 2)
+$headerRule.BackColor = $cAccent
+$form.Controls.Add($headerRule)
+
+# status panel: a state-coloured accent bar on the left + the status text
+$statusAccent = New-Object System.Windows.Forms.Panel
+$statusAccent.Location = New-Object System.Drawing.Point(20, 62)
+$statusAccent.Size = New-Object System.Drawing.Size(5, 124)
+$statusAccent.BackColor = [System.Drawing.Color]::FromArgb(70, 74, 84)
+$form.Controls.Add($statusAccent)
+
 $statusBox = New-Object System.Windows.Forms.Label
-$statusBox.Location = New-Object System.Drawing.Point(20, 52)
-$statusBox.Size = New-Object System.Drawing.Size(508, 130)
+$statusBox.Location = New-Object System.Drawing.Point(25, 62)
+$statusBox.Size = New-Object System.Drawing.Size(503, 124)
 $statusBox.BackColor = [System.Drawing.Color]::FromArgb(22, 24, 28)
 $statusBox.ForeColor = [System.Drawing.Color]::Gainsboro
 $statusBox.Font = New-Object System.Drawing.Font('Consolas', 9.5)
@@ -163,6 +187,14 @@ $statusBox.Padding = New-Object System.Windows.Forms.Padding(10)
 $statusBox.Text = "  Loading status..."
 $form.Controls.Add($statusBox)
 
+# nudge a colour brighter (+) or darker (-) for hover/press states
+function Shift-Color($c, [int]$d) {
+    $r = [Math]::Max(0, [Math]::Min(255, [int]$c.R + $d))
+    $g = [Math]::Max(0, [Math]::Min(255, [int]$c.G + $d))
+    $b = [Math]::Max(0, [Math]::Min(255, [int]$c.B + $d))
+    [System.Drawing.Color]::FromArgb($r, $g, $b)
+}
+
 function New-BigButton($text, $x, $y, $w, $h, $color) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
@@ -170,20 +202,24 @@ function New-BigButton($text, $x, $y, $w, $h, $color) {
     $b.Size = New-Object System.Drawing.Size($w, $h)
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
+    $b.FlatAppearance.MouseOverBackColor = (Shift-Color $color 20)
+    $b.FlatAppearance.MouseDownBackColor = (Shift-Color $color -16)
     $b.BackColor = $color
     $b.ForeColor = [System.Drawing.Color]::White
     $b.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.TextAlign = 'MiddleCenter'
     $form.Controls.Add($b)
     return $b
 }
 
-$btnPlay = New-BigButton "PLAY  -  get the latest world, launch Valheim, upload after" 20 196 508 56 ([System.Drawing.Color]::FromArgb(76, 175, 80))
-$btnExtract = New-BigButton "1. EXTRACT (before you play)" 20 260 248 40 ([System.Drawing.Color]::FromArgb(46, 125, 50))
+$btnPlay = New-BigButton "$([char]0x25B6)   PLAY   -   latest world, launch Valheim, upload after" 20 196 508 56 ([System.Drawing.Color]::FromArgb(76, 175, 80))
+$btnExtract = New-BigButton "$([char]0x2193)  EXTRACT   -   before you play" 20 260 248 40 ([System.Drawing.Color]::FromArgb(46, 125, 50))
 $btnExtract.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
-$btnUpload  = New-BigButton "2. UPLOAD (after you play)"  280 260 248 40 ([System.Drawing.Color]::FromArgb(21, 101, 192))
+$btnUpload  = New-BigButton "$([char]0x2191)  UPLOAD   -   after you play"  280 260 248 40 ([System.Drawing.Color]::FromArgb(21, 101, 192))
 $btnUpload.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
 
+$cSmall = [System.Drawing.Color]::FromArgb(52, 56, 64)
 function New-SmallButton($text, $x, $w, $y = 308) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
@@ -191,7 +227,9 @@ function New-SmallButton($text, $x, $w, $y = 308) {
     $b.Size = New-Object System.Drawing.Size($w, 30)
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
-    $b.BackColor = [System.Drawing.Color]::FromArgb(55, 58, 66)
+    $b.FlatAppearance.MouseOverBackColor = (Shift-Color $cSmall 18)
+    $b.FlatAppearance.MouseDownBackColor = (Shift-Color $cSmall -10)
+    $b.BackColor = $cSmall
     $b.ForeColor = [System.Drawing.Color]::Gainsboro
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
     $form.Controls.Add($b)
@@ -341,11 +379,19 @@ function Format-Age([string]$utc) {
     } catch { return $utc }
 }
 
+# colours reused for status text + the left accent bar
+$cGold = [System.Drawing.Color]::FromArgb(235, 189, 90)
+$cRed  = [System.Drawing.Color]::FromArgb(214, 92, 82)
+$cGray = [System.Drawing.Color]::FromArgb(70, 74, 84)
+$cBlue = [System.Drawing.Color]::FromArgb(96, 140, 205)
+
+function Set-StatusColor($fore, $bar) { $statusBox.ForeColor = $fore; $statusAccent.BackColor = $bar }
+
 function Update-Status($p) {
-    if (-not $p) { $statusBox.ForeColor = [System.Drawing.Color]::Gray; $statusBox.Text = "  Status unavailable."; return }
-    if ($p.error) { $statusBox.ForeColor = [System.Drawing.Color]::IndianRed; $statusBox.Text = "  Problem: $($p.error)"; return }
+    if (-not $p) { Set-StatusColor ([System.Drawing.Color]::Gray) $cGray; $statusBox.Text = "  Status unavailable."; return }
+    if ($p.error) { Set-StatusColor $cRed $cRed; $statusBox.Text = "  Problem: $($p.error)"; return }
     if (-not $p.configured) {
-        $statusBox.ForeColor = [System.Drawing.Color]::Gold
+        Set-StatusColor $cGold $cGold
         $statusBox.Text = "  Not set up yet.`r`n`r`n  Click 'Setup' and paste your Backblaze bucket + key."
         return
     }
@@ -359,17 +405,18 @@ function Update-Status($p) {
     if ($script:bucketBytes -gt 0) {
         $lines += ("  Bucket: {0:N2} GB used (B2 free tier: 10 GB)" -f ($script:bucketBytes / 1GB))
     }
+    $dot = [char]0x25CF
     if ($p.hostingPlayer) {
         $lines += ""
         $suffix = if ($p.lockStale) { " - looks abandoned" } else { "" }
-        $lines += "  [LOCKED] $($p.hostingPlayer) is hosting now (since $(Format-Age $p.hostingSinceUtc))$suffix"
-        $statusBox.ForeColor = [System.Drawing.Color]::Gold
+        $lines += "  $dot LOCKED  $($p.hostingPlayer) is hosting now (since $(Format-Age $p.hostingSinceUtc))$suffix"
+        Set-StatusColor $cGold $cGold
     } elseif (-not $p.cloudEmpty) {
         $lines += ""
-        $lines += "  [FREE] Nobody is hosting - safe to EXTRACT and play"
-        $statusBox.ForeColor = [System.Drawing.Color]::FromArgb(120, 200, 120)
+        $lines += "  $dot FREE  nobody is hosting - safe to EXTRACT and play"
+        Set-StatusColor ([System.Drawing.Color]::FromArgb(150, 210, 150)) $cAccent
     } else {
-        $statusBox.ForeColor = [System.Drawing.Color]::Gainsboro
+        Set-StatusColor ([System.Drawing.Color]::Gainsboro) $cBlue
     }
     if ($p.localExists -and $p.localNewer) {
         $lines += "  Note  : your local copy looks NEWER - UPLOAD it if you just played"
