@@ -25,6 +25,39 @@ $ConfigPath = Join-Path $ScriptDir 'config.json'
 $RepoSlug   = 'SK000001/valheim-world-sync'
 $VersionFile = Join-Path $ScriptDir 'VERSION'
 $AppVersion = if (Test-Path $VersionFile) { (Get-Content $VersionFile -Raw).Trim() } else { '1.0' }
+$DefaultWorldsPath = '%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local'
+
+# ---------- shared helpers ----------
+function Get-ConfigObj {
+    if (Test-Path $ConfigPath) { try { return Get-Content $ConfigPath -Raw | ConvertFrom-Json } catch {} }
+    return $null
+}
+
+# The Valheim saves folder, honouring a customised WorldsPath in config.json
+# rather than assuming the default location.
+function Get-WorldsFolder {
+    $c = Get-ConfigObj
+    $p = if ($c -and $c.WorldsPath) { $c.WorldsPath } else { $DefaultWorldsPath }
+    [System.Environment]::ExpandEnvironmentVariables($p)
+}
+
+# DPAPI helpers (mirror the engine) so Setup can store the B2 key encrypted.
+function Protect-Secret([string]$plain) {
+    if (-not $plain) { return '' }
+    try {
+        Add-Type -AssemblyName System.Security
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
+        return [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, 'CurrentUser'))
+    } catch { return '' }
+}
+function Unprotect-Secret([string]$enc) {
+    if (-not $enc) { return '' }
+    try {
+        Add-Type -AssemblyName System.Security
+        $bytes = [Convert]::FromBase64String($enc)
+        return [System.Text.Encoding]::UTF8.GetString([System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, 'CurrentUser'))
+    } catch { return '' }
+}
 
 # ---------- async runner state ----------
 $script:busy        = $false
@@ -84,7 +117,7 @@ function New-DesktopShortcut {
 # ============================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Valheim Sync v$AppVersion"
-$form.Size = New-Object System.Drawing.Size(560, 560)
+$form.Size = New-Object System.Drawing.Size(560, 600)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -151,10 +184,10 @@ $btnExtract.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Draw
 $btnUpload  = New-BigButton "2. UPLOAD (after you play)"  280 260 248 40 ([System.Drawing.Color]::FromArgb(21, 101, 192))
 $btnUpload.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
 
-function New-SmallButton($text, $x, $w) {
+function New-SmallButton($text, $x, $w, $y = 308) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
-    $b.Location = New-Object System.Drawing.Point($x, 308)
+    $b.Location = New-Object System.Drawing.Point($x, $y)
     $b.Size = New-Object System.Drawing.Size($w, 30)
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
@@ -170,17 +203,20 @@ $btnSetup   = New-SmallButton 'Setup'            118 72
 $btnRestore = New-SmallButton 'Restore'          196 92
 $btnShare   = New-SmallButton 'Share to friends' 294 120
 $btnOpen    = New-SmallButton 'Save folder'      420 108
+# second row
+$btnRelease = New-SmallButton 'Release lock'     20  120 342
+$btnViewLog = New-SmallButton 'View log'         146 90  342
 
 # log
 $logLabel = New-Object System.Windows.Forms.Label
 $logLabel.Text = 'Activity'
 $logLabel.ForeColor = [System.Drawing.Color]::Gray
-$logLabel.Location = New-Object System.Drawing.Point(20, 348)
+$logLabel.Location = New-Object System.Drawing.Point(20, 382)
 $logLabel.Size = New-Object System.Drawing.Size(200, 18)
 $form.Controls.Add($logLabel)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = New-Object System.Drawing.Point(20, 368)
+$log.Location = New-Object System.Drawing.Point(20, 402)
 $log.Size = New-Object System.Drawing.Size(508, 144)
 $log.Multiline = $true
 $log.ReadOnly = $true
@@ -208,6 +244,7 @@ function Set-Buttons([bool]$on) {
     $btnSetup.Enabled = $on
     $btnRestore.Enabled = $on
     $btnShare.Enabled = $on
+    $btnRelease.Enabled = $on
 }
 
 function Read-NewText([string]$path, [ref]$offset) {
@@ -404,11 +441,22 @@ function Start-SessionWatcher {
 }
 
 # ---------- auto-update from GitHub ----------
-function Install-Update([string]$url) {
+function Install-Update([string]$url, [string]$expectedHash) {
     try {
         Append-Log "Downloading update..."
         $tmpzip = Join-Path $env:TEMP ("vsync-update-" + [guid]::NewGuid() + ".zip")
         Invoke-WebRequest -Uri $url -OutFile $tmpzip -UseBasicParsing
+        # Verify against the checksum published in the release, when present, so a
+        # tampered or truncated download can never overwrite the running engine.
+        if ($expectedHash) {
+            $got = (Get-FileHash $tmpzip -Algorithm SHA256).Hash
+            if ($got -ne $expectedHash) {
+                Remove-Item $tmpzip -Force -ErrorAction SilentlyContinue
+                Info-Box "Update aborted: the download's checksum did not match the one published with the release.`r`n`r`nNothing was changed. Try again later."
+                return
+            }
+            Append-Log "Update verified (SHA256 matches the release)."
+        }
         $tmpdir = Join-Path $env:TEMP ("vsync-update-" + [guid]::NewGuid())
         Expand-Archive -Path $tmpzip -DestinationPath $tmpdir -Force
         $root = Get-ChildItem $tmpdir -Directory | Select-Object -First 1
@@ -435,8 +483,24 @@ function Check-Update {
         if (-not $latest) { return }
         if ([version]$latest -gt [version]$AppVersion) {
             $asset = $rel.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
-            if ($asset -and (Confirm-Box "A new version is available: v$latest (you have v$AppVersion).`r`n`r`nDownload and install it now? Your config and saves are kept.")) {
-                Install-Update $asset.browser_download_url
+            if (-not $asset) { return }
+            # Find a published checksum: either <zip>.sha256 or a SHA256SUMS file.
+            $expected = ''
+            try {
+                $sumAsset = $rel.assets | Where-Object { $_.name -ieq ($asset.name + '.sha256') -or $_.name -ieq 'SHA256SUMS' -or $_.name -ieq 'checksums.txt' } | Select-Object -First 1
+                if ($sumAsset) {
+                    $txt = Invoke-RestMethod -Uri $sumAsset.browser_download_url -Headers @{ 'User-Agent' = 'valheim-sync' } -TimeoutSec 8
+                    foreach ($line in ([string]$txt -split "`r?`n")) {
+                        if ($line -match '([0-9A-Fa-f]{64})') {
+                            $h = $Matches[1]
+                            if ($line -match [regex]::Escape($asset.name) -or $sumAsset.name -ieq ($asset.name + '.sha256')) { $expected = $h.ToUpper(); break }
+                            if (-not $expected) { $expected = $h.ToUpper() }
+                        }
+                    }
+                }
+            } catch {}
+            if (Confirm-Box "A new version is available: v$latest (you have v$AppVersion).`r`n`r`nDownload and install it now? Your config and saves are kept.") {
+                Install-Update $asset.browser_download_url $expected
             }
         }
     } catch {}
@@ -536,6 +600,31 @@ $btnUpload.Add_Click({
 })
 
 $btnRefresh.Add_Click({ Refresh-Status })
+
+$btnViewLog.Add_Click({
+    $logPath = Join-Path $ScriptDir 'vsync.log'
+    if (Test-Path $logPath) { Start-Process notepad.exe $logPath }
+    else { Info-Box "No activity log yet ($logPath).`r`n`r`nThe background watcher writes here once you've hosted a session." }
+})
+
+$btnRelease.Add_Click({
+    Invoke-Action 'Probe' {
+        param($out)
+        $p = Parse-Probe $out
+        Update-Status $p
+        if (-not $p) { Info-Box "Couldn't read the cloud status. Check your internet and try Refresh."; return }
+        if (-not $p.configured) { Info-Box "Not set up yet. Click 'Setup' first."; return }
+        if (-not $p.hostingPlayer) { Info-Box "The lock is already free - nobody is marked as hosting."; return }
+        $who = if ($p.hostingPlayer -eq $p.me) { "your" } else { "$($p.hostingPlayer)'s" }
+        if (-not (Confirm-Box "Release $who host lock on '$($p.world)'?`r`n`r`nThis frees the world WITHOUT uploading. Use it only if a session is stuck and the holder is not going to upload.")) { return }
+        Invoke-Action 'Unlock' {
+            param($o)
+            Refresh-Status
+            if ($script:lastExit -ne 0) { Info-Box "Couldn't release the lock - see the Activity log."; return }
+            Info-Box "Lock released - anyone can EXTRACT and host next."
+        }
+    }
+})
 
 # Replace the LOCAL world with a zip from local-backups/ (the cloud is not
 # touched). The current local world is zipped first as a safety net.
@@ -654,14 +743,14 @@ $btnShare.Add_Click({
 })
 
 $btnOpen.Add_Click({
-    $worlds = [System.Environment]::ExpandEnvironmentVariables('%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local')
+    $worlds = Get-WorldsFolder
     if (Test-Path $worlds) { Start-Process explorer.exe $worlds } else { Info-Box "Save folder not found:`r`n$worlds" }
 })
 
 # Worlds that exist in the local save folder (one .db per world).
 function Get-DetectedWorlds {
     try {
-        $wl = [System.Environment]::ExpandEnvironmentVariables('%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local')
+        $wl = Get-WorldsFolder
         if (Test-Path $wl) {
             return @(Get-ChildItem $wl -File | Where-Object { $_.Extension -eq '.db' } |
                 ForEach-Object { $_.BaseName } | Sort-Object -Unique)
@@ -677,7 +766,7 @@ function Show-SetupDialog {
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Setup - Backblaze B2'
-    $dlg.Size = New-Object System.Drawing.Size(440, 430)
+    $dlg.Size = New-Object System.Drawing.Size(440, 560)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
@@ -699,9 +788,16 @@ function Show-SetupDialog {
         return $t
     }
 
+    # decrypt the stored key for prefill (DPAPI), falling back to a legacy plaintext key
+    $existingApp = ''
+    if ($cfg) {
+        if (($cfg.B2.PSObject.Properties.Name -contains 'AppKeyEnc') -and $cfg.B2.AppKeyEnc) { $existingApp = Unprotect-Secret $cfg.B2.AppKeyEnc }
+        elseif (($cfg.B2.PSObject.Properties.Name -contains 'AppKey') -and $cfg.B2.AppKey -and $cfg.B2.AppKey -ne 'PASTE_APP_KEY_HERE') { $existingApp = $cfg.B2.AppKey }
+    }
+
     $tBucket = Add-Field 'Bucket name'        14  ($(if($cfg){$cfg.B2.Bucket})) $false
     $tKey    = Add-Field 'keyID'              62  ($(if($cfg -and $cfg.B2.KeyId -ne 'PASTE_KEY_ID_HERE'){$cfg.B2.KeyId})) $false
-    $tApp    = Add-Field 'applicationKey'     110 ($(if($cfg -and $cfg.B2.AppKey -ne 'PASTE_APP_KEY_HERE'){$cfg.B2.AppKey})) $true
+    $tApp    = Add-Field 'applicationKey'     110 $existingApp $true
 
     # world name: editable dropdown pre-filled with the worlds found on this PC,
     # so nobody has to type (and typo) the name by hand
@@ -738,15 +834,28 @@ function Show-SetupDialog {
     })
     $dlg.Controls.Add($testBtn)
 
+    $existingRole = if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'DiscordRoleId')) { $cfg.DiscordRoleId } else { '' }
+    $tRole = Add-Field 'Discord role ID to @mention (optional)' 302 $existingRole $false
+    $existingNtfy = if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'NtfyUrl')) { $cfg.NtfyUrl } else { '' }
+    $tNtfy = Add-Field 'ntfy topic URL (optional, non-Discord groups)' 350 $existingNtfy $false
+
+    $cAuto = New-Object System.Windows.Forms.CheckBox
+    $cAuto.Text = 'Upload automatically when I close the game (no prompt)'
+    $cAuto.ForeColor = [System.Drawing.Color]::Gainsboro
+    $cAuto.Location = New-Object System.Drawing.Point(20, 400)
+    $cAuto.Size = New-Object System.Drawing.Size(390, 24)
+    $cAuto.Checked = [bool]($cfg -and ($cfg.PSObject.Properties.Name -contains 'AutoUploadOnClose') -and $cfg.AutoUploadOnClose)
+    $dlg.Controls.Add($cAuto)
+
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = 'Save & Test'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $ok.Location = New-Object System.Drawing.Point(224, 330); $ok.Size = New-Object System.Drawing.Size(90, 30)
+    $ok.Location = New-Object System.Drawing.Point(224, 440); $ok.Size = New-Object System.Drawing.Size(90, 30)
     $ok.FlatStyle = 'Flat'; $ok.BackColor = [System.Drawing.Color]::FromArgb(21, 101, 192); $ok.ForeColor = 'White'
     $dlg.Controls.Add($ok); $dlg.AcceptButton = $ok
 
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = 'Cancel'; $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $cancel.Location = New-Object System.Drawing.Point(320, 330); $cancel.Size = New-Object System.Drawing.Size(80, 30)
+    $cancel.Location = New-Object System.Drawing.Point(320, 440); $cancel.Size = New-Object System.Drawing.Size(80, 30)
     $cancel.FlatStyle = 'Flat'; $cancel.BackColor = [System.Drawing.Color]::FromArgb(55, 58, 66); $cancel.ForeColor = 'Gainsboro'
     $dlg.Controls.Add($cancel); $dlg.CancelButton = $cancel
 
@@ -756,13 +865,21 @@ function Show-SetupDialog {
             return
         }
         $new = [pscustomobject]@{
-            WorldName      = $(if ($tWorld.Text) { $tWorld.Text } else { 'sivandarvin' })
-            WorldsPath     = '%USERPROFILE%\AppData\LocalLow\IronGate\Valheim\worlds_local'
-            Player         = $tPlayer.Text
-            DiscordWebhook = $tDiscord.Text
-            LockStaleHours = $(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'LockStaleHours' -and $cfg.LockStaleHours) { $cfg.LockStaleHours } else { 6 })
-            HistoryKeep    = $(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'HistoryKeep' -and $cfg.HistoryKeep) { $cfg.HistoryKeep } else { 20 })
-            B2             = [pscustomobject]@{ Bucket = $tBucket.Text; KeyId = $tKey.Text; AppKey = $tApp.Text }
+            WorldName        = $(if ($tWorld.Text) { $tWorld.Text } else { 'sivandarvin' })
+            WorldsPath       = $(if ($cfg -and $cfg.WorldsPath) { $cfg.WorldsPath } else { $DefaultWorldsPath })
+            Player           = $tPlayer.Text
+            DiscordWebhook   = $tDiscord.Text
+            DiscordRoleId    = $tRole.Text.Trim()
+            NtfyUrl          = $tNtfy.Text.Trim()
+            AutoUploadOnClose = [bool]$cAuto.Checked
+            LockStaleHours   = $(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'LockStaleHours' -and $cfg.LockStaleHours) { $cfg.LockStaleHours } else { 6 })
+            HistoryKeep      = $(if ($cfg -and $cfg.PSObject.Properties.Name -contains 'HistoryKeep' -and $cfg.HistoryKeep) { $cfg.HistoryKeep } else { 20 })
+            # B2 key stored encrypted at rest (DPAPI); Package.ps1 writes plaintext for the friends zip
+            B2               = [pscustomobject]@{ Bucket = $tBucket.Text; KeyId = $tKey.Text; AppKeyEnc = (Protect-Secret $tApp.Text) }
+        }
+        # preserve an advanced custom rclone Remote block if the user added one by hand
+        if ($cfg -and ($cfg.PSObject.Properties.Name -contains 'Remote') -and $cfg.Remote) {
+            $new | Add-Member -NotePropertyName Remote -NotePropertyValue $cfg.Remote -Force
         }
         $new | ConvertTo-Json -Depth 6 | Set-Content $ConfigPath -Encoding UTF8
         Append-Log "Saved config.json - testing connection..."
@@ -772,6 +889,33 @@ function Show-SetupDialog {
 }
 
 $btnSetup.Add_Click({ Show-SetupDialog })
+
+# ---------- minimize to tray ----------
+# Keep Valheim Sync running quietly as a lock/presence indicator: minimizing
+# hides it to the notification area; double-click (or the menu) brings it back.
+$tray = New-Object System.Windows.Forms.NotifyIcon
+$tray.Text = 'Valheim Sync'
+if (Test-Path $IconPath) { try { $tray.Icon = New-Object System.Drawing.Icon($IconPath) } catch {} }
+if (-not $tray.Icon) { $tray.Icon = [System.Drawing.SystemIcons]::Application }
+$tray.Visible = $false
+
+function Restore-FromTray {
+    $form.Show(); $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+    $form.Activate(); $tray.Visible = $false
+}
+
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+[void]$trayMenu.Items.Add('Open', $null, { Restore-FromTray })
+[void]$trayMenu.Items.Add('Exit', $null, { $tray.Visible = $false; $form.Close() })
+$tray.ContextMenuStrip = $trayMenu
+$tray.Add_DoubleClick({ Restore-FromTray })
+
+$form.Add_Resize({
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        $form.Hide(); $tray.Visible = $true
+        $tray.ShowBalloonTip(1500, 'Valheim Sync', 'Still running - double-click the tray icon to reopen.', [System.Windows.Forms.ToolTipIcon]::Info)
+    }
+})
 
 # ============================================================
 $form.Add_Shown({
@@ -784,5 +928,5 @@ $form.Add_Shown({
     }
     $updateTimer.Start(); $autoTimer.Start()
 })
-$form.Add_FormClosing({ if ($timer) { $timer.Stop() }; if ($updateTimer) { $updateTimer.Stop() }; if ($autoTimer) { $autoTimer.Stop() } })
+$form.Add_FormClosing({ if ($timer) { $timer.Stop() }; if ($updateTimer) { $updateTimer.Stop() }; if ($autoTimer) { $autoTimer.Stop() }; if ($tray) { $tray.Visible = $false; $tray.Dispose() } })
 [void]$form.ShowDialog()

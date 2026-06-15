@@ -3,7 +3,11 @@
   "WorldsPath": "%USERPROFILE%\\AppData\\LocalLow\\IronGate\\Valheim\\worlds_local",
   "Player": "your-name",
   "DiscordWebhook": "",
+  "DiscordRoleId": "",
+  "NtfyUrl": "",
+  "AutoUploadOnClose": false,
   "LockStaleHours": 6,
+  "HistoryKeep": 20,
   "B2": {
     "Bucket": "your-bucket-name",
     "KeyId": "PASTE_KEY_ID_HERE",
